@@ -5,11 +5,20 @@ module.exports = {
   env: {
     node: true,
     es2020: true,
+    browser: true,
   },
   parserOptions: {
     ecmaVersion: 2020,
     sourceType: 'module',
   },
+  overrides: [
+    {
+      files: ['**/*.test.ts', '**/*.spec.ts', 'src/__tests__/**/*.ts'],
+      env: {
+        jest: true,
+      },
+    },
+  ],
   rules: {
     'prefer-const': 'error',
     'no-var': 'error',

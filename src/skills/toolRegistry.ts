@@ -1,5 +1,7 @@
 import { Logger } from '../utils/logger';
 import { BrowserEngine } from '../browser/engine';
+import { SemanticMemory } from '../memory/semanticMemory';
+import { ComputerUseOrchestrator } from '../computer-use/orchestrator';
 
 // ──────────────────────────────────────────────
 // Types
@@ -77,9 +79,14 @@ export class ToolRegistry {
 // Factory: register all built-in tools
 // ──────────────────────────────────────────────
 
-export function createDefaultToolRegistry(browserEngine: BrowserEngine): ToolRegistry {
+export function createDefaultToolRegistry(
+  browserEngine: BrowserEngine,
+  memory?: SemanticMemory,
+  computerOrchestrator?: ComputerUseOrchestrator
+): ToolRegistry {
   const registry = new ToolRegistry();
   const logger = new Logger('BuiltinTools');
+
 
   // ── Web Search (DuckDuckGo scrape — no API key needed) ──
   registry.register({
@@ -357,13 +364,18 @@ export function createDefaultToolRegistry(browserEngine: BrowserEngine): ToolReg
         try { parsed = JSON.parse(text); } catch { /* keep as text */ }
       }
 
+      const responseHeaders: Record<string, string> = {};
+      response.headers.forEach((value, key) => {
+        responseHeaders[key] = value;
+      });
+
       return {
         success: response.ok,
         data: {
           status: response.status,
           statusText: response.statusText,
           body: parsed,
-          headers: Object.fromEntries(response.headers.entries()),
+          headers: responseHeaders,
         },
         error: response.ok ? undefined : `HTTP ${response.status}: ${response.statusText}`,
       };
@@ -424,13 +436,42 @@ export function createDefaultToolRegistry(browserEngine: BrowserEngine): ToolReg
       tags: { type: 'string', description: 'Comma-separated tags for categorization' },
     },
     handler: async (input) => {
-      // Note: This needs SemanticMemory injected — handled via closure or later injection
-      logger.info(`[store_memory] Tool called but memory not injected into this handler yet.`);
-      return {
-        success: false,
-        error: 'Memory store tool requires SemanticMemory injection. Use AgentRuntime.execute() with memory enabled.',
-      };
+      if (!memory) {
+        return { success: false, error: 'SemanticMemory not available. Cannot store.' };
+      }
+      try {
+        await memory.store(
+           input.content as string,
+           'user_memory',
+           { tags: (input.tags as string)?.split(',') || [] }
+        );
+        return { success: true, data: { stored: true } };
+      } catch (e: any) {
+        return { success: false, error: e.message };
+      }
     },
+  });
+
+  // ── Memory Recall ──
+  registry.register({
+    name: 'memory_recall',
+    description: 'Retrieve relevant information from long-term memory.',
+    inputSchema: {
+      query: { type: 'string', description: 'Search query to find relevant memories', required: true },
+      count: { type: 'number', description: 'Number of memories to retrieve (default 5)' }
+    },
+    handler: async (input) => {
+      if (!memory) {
+         return { success: false, error: 'SemanticMemory not available' };
+      }
+      try {
+        const count = (input.count as number) || 5;
+        const results = await memory.recall(input.query as string, count);
+        return { success: true, data: { memories: results } };
+      } catch (e: any) {
+        return { success: false, error: e.message };
+      }
+    }
   });
 
   // ── JavaScript evaluation in browser ──
@@ -444,6 +485,105 @@ export function createDefaultToolRegistry(browserEngine: BrowserEngine): ToolReg
       const result = await browserEngine.evaluate(input.script as string);
       return { success: true, data: { result } };
     },
+  });
+
+  // ── Edit file ──
+  registry.register({
+    name: 'edit_file',
+    description: 'Edit a file using search and replace or line insertion. Use this instead of rewrite for large files.',
+    inputSchema: {
+      path: { type: 'string', description: 'File path to edit', required: true },
+      operation: { type: 'string', description: 'Operation: replace, insert, append', required: true },
+      searchPattern: { type: 'string', description: 'Text or regex to search for (for replace)' },
+      content: { type: 'string', description: 'Content to insert or replace with', required: true },
+    },
+    handler: async (input) => {
+      const fs = await import('fs/promises');
+      const path = await import('path');
+      const filePath = path.resolve(input.path as string);
+
+      try {
+        let text = await fs.readFile(filePath, 'utf-8');
+        const operation = input.operation as string;
+        const searchPattern = input.searchPattern as string | undefined;
+        const content = input.content as string;
+
+        if (operation === 'replace' && searchPattern) {
+          text = text.replace(new RegExp(searchPattern, 'g'), content);
+        } else if (operation === 'insert') {
+          text += '\\n' + content;
+        } else if (operation === 'append') {
+          text += content;
+        }
+
+        await fs.writeFile(filePath, text, 'utf-8');
+        return { success: true, data: { path: filePath, operation } };
+      } catch (error: any) {
+        return { success: false, error: `Edit failed: ${error.message}` };
+      }
+    },
+  });
+
+  // ── Search files ──
+  registry.register({
+    name: 'search_files',
+    description: 'Search for a string or regex pattern across files in a directory.',
+    inputSchema: {
+      dir: { type: 'string', description: 'Directory to search in', required: true },
+      pattern: { type: 'string', description: 'Search pattern', required: true },
+    },
+    handler: async (input) => {
+      const fs = await import('fs/promises');
+      const path = await import('path');
+      const dir = input.dir as string;
+      const pattern = input.pattern as string;
+      const results: string[] = [];
+      
+      const search = async (dirPath: string) => {
+        if (results.length > 50) return;
+        try {
+          const entries = await fs.readdir(dirPath, { withFileTypes: true });
+          for (const e of entries) {
+            const fullPath = path.join(dirPath, e.name);
+            if (e.isDirectory() && !['.git', 'node_modules', 'dist', 'build'].includes(e.name)) {
+                await search(fullPath);
+            } else if (e.isFile()) {
+                try {
+                  const text = await fs.readFile(fullPath, 'utf-8');
+                  if (text.includes(pattern)) {
+                    results.push(fullPath);
+                  }
+                } catch {
+                  // Ignore unreadable/non-text files during search.
+                }
+            }
+          }
+        } catch {
+          // Ignore directories that disappear or cannot be read.
+        }
+      };
+      
+      await search(path.resolve(dir));
+      return { success: true, data: { matches: results } };
+    },
+  });
+
+  // ── Computer Screenshot ──
+  registry.register({
+    name: 'computer_screenshot',
+    description: 'Take a screenshot of the entire desktop computer screen.',
+    inputSchema: {},
+    handler: async () => {
+      if (!computerOrchestrator) {
+         return { success: false, error: 'ComputerUseOrchestrator not available' };
+      }
+      try {
+        const screenshot = await computerOrchestrator.captureScreen({});
+        return { success: true, data: { screenshot, mimeType: 'image/png' } };
+      } catch (e: any) {
+        return { success: false, error: e.message };
+      }
+    }
   });
 
   logger.info(`Registered ${registry.listTools().length} built-in tools`);

@@ -16,6 +16,13 @@ import { desktopRoutes } from './routes/desktop';
 import { identityRoutes } from './routes/identity';
 import { SkillRegistry } from '../skills/skillRegistry';
 import { SkillExecutor } from '../skills/skillExecutor';
+import { AgentRuntime, CronScheduler, UsageTracker } from './types';
+
+// Agentic AI imports (Web-UI, Cline, Code-Assistant-AI integration)
+import { CodeParser, RAGChain } from '../code-analysis';
+import { ReActAgent, AgentFactory, DeepResearchAgent } from '../agents/react';
+import { ToolParser, DEFAULT_TOOLS, ResponseFormatter } from '../tool-use';
+import { LangGraphOrchestrator } from '../agents/orchestrator/langGraph';
 
 interface ServerConfig {
   host: string;
@@ -40,9 +47,17 @@ export class APIServer {
   private skillRegistry: SkillRegistry;
   private skillExecutor: SkillExecutor;
   // Phase 1 systems (optional, injected after construction)
-  private agentRuntime?: any; // AgentRuntime — avoiding circular import
-  private cronScheduler?: any; // CronScheduler
-  private usageTracker?: any;  // UsageTracker
+  private agentRuntime?: AgentRuntime;
+  private cronScheduler?: CronScheduler;
+  private usageTracker?: UsageTracker;
+
+  // Agentic AI systems
+  private codeParser: CodeParser;
+  private ragChain: RAGChain | null = null;
+  private agentFactory: AgentFactory;
+  private deepResearchAgent: DeepResearchAgent;
+  private toolParser: ToolParser;
+  private activeAgents: Map<string, ReActAgent> = new Map();
 
   constructor(
     config: ServerConfig,
@@ -73,8 +88,15 @@ export class APIServer {
     this.skillExecutor = new SkillExecutor(this.skillRegistry);
     this.registerDefaultSkills();
 
+    // Initialize Agentic AI systems
+    this.codeParser = new CodeParser();
+    this.agentFactory = new AgentFactory(this.modelRouter);
+    this.deepResearchAgent = new DeepResearchAgent(this.modelRouter, this.browserEngine);
+    this.toolParser = new ToolParser(DEFAULT_TOOLS);
+    this.logger.info('Agentic AI systems initialized');
+
     this.fastify = Fastify({
-      logger: false // We'll use our own logger
+      logger: false, // We'll use our own logger
     });
 
     this.wsEventManager = new WebSocketEventManager(this.fastify);
@@ -83,14 +105,37 @@ export class APIServer {
     this.setupRoutes();
   }
 
+  private langGraphOrchestrator?: LangGraphOrchestrator;
+
   /**
    * Inject Phase 1 systems after construction to avoid circular dependencies
    */
-  setRuntime(runtime: any, cronScheduler: any, usageTracker: any): void {
-    this.agentRuntime = runtime;
+  setRuntime(
+    agentRuntime: AgentRuntime,
+    cronScheduler: CronScheduler,
+    usageTracker: UsageTracker
+  ): void {
+    this.agentRuntime = agentRuntime;
     this.cronScheduler = cronScheduler;
     this.usageTracker = usageTracker;
     this.logger.info('Phase 1 runtime systems injected into API server');
+
+    // Wire AgentRuntime events to WebSocket manager
+    this.agentRuntime.events.on('execution:start', (data: any) => this.wsEventManager.broadcast({ type: 'agent:execution:start', data, timestamp: new Date().toISOString() }));
+    this.agentRuntime.events.on('step:thought', (data: any) => this.wsEventManager.broadcast({ type: 'agent:step:thought', data, timestamp: new Date().toISOString() }));
+    this.agentRuntime.events.on('step:action', (data: any) => this.wsEventManager.broadcast({ type: 'agent:step:action', data, timestamp: new Date().toISOString() }));
+    this.agentRuntime.events.on('step:observation', (data: any) => this.wsEventManager.broadcast({ type: 'agent:step:observation', data, timestamp: new Date().toISOString() }));
+    this.agentRuntime.events.on('execution:complete', (data: any) => this.wsEventManager.broadcast({ type: 'agent:execution:complete', data, timestamp: new Date().toISOString() }));
+  }
+
+  setLangGraphOrchestrator(orchestrator: LangGraphOrchestrator): void {
+    this.langGraphOrchestrator = orchestrator;
+    this.langGraphOrchestrator.events.on('graph:start', (data: any) => this.wsEventManager.broadcast({ type: 'graph:start', data, timestamp: new Date().toISOString() }));
+    this.langGraphOrchestrator.events.on('graph:node_start', (data: any) => this.wsEventManager.broadcast({ type: 'graph:node_start', data, timestamp: new Date().toISOString() }));
+    this.langGraphOrchestrator.events.on('graph:transition', (data: any) => this.wsEventManager.broadcast({ type: 'graph:transition', data, timestamp: new Date().toISOString() }));
+    this.langGraphOrchestrator.events.on('graph:complete', (data: any) => this.wsEventManager.broadcast({ type: 'graph:complete', data, timestamp: new Date().toISOString() }));
+    this.langGraphOrchestrator.events.on('graph:failure', (data: any) => this.wsEventManager.broadcast({ type: 'graph:failure', data, timestamp: new Date().toISOString() }));
+    this.logger.info('LangGraphOrchestrator injected into API server');
   }
 
   /** Exposes the Fastify instance so plugins can register routes before server start. */
@@ -103,7 +148,7 @@ export class APIServer {
     this.fastify.register(fastifyCors, {
       origin: this.config.corsOrigins,
       credentials: true,
-      methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+      methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     });
 
     // WebSocket support
@@ -201,7 +246,10 @@ export class APIServer {
     this.fastify.post('/api/computer/task', this.handleExecuteComputerTask.bind(this));
     this.fastify.post('/api/computer/command', this.handleProcessNaturalCommand.bind(this));
     this.fastify.get('/api/computer/operators', this.handleListDigitalOperators.bind(this));
-    this.fastify.get('/api/computer/operators/:name/status', this.handleGetOperatorStatus.bind(this));
+    this.fastify.get(
+      '/api/computer/operators/:name/status',
+      this.handleGetOperatorStatus.bind(this)
+    );
     this.fastify.get('/api/computer/screenshot', this.handleGetScreenshot.bind(this));
 
     // Heartbeat operations
@@ -215,8 +263,34 @@ export class APIServer {
     // Identity routes (device identity, tokens, pairing)
     this.fastify.register(identityRoutes);
 
+    // ============================================================================
+    // AGENTIC AI ROUTES (Web-UI, Cline, Code-Assistant-AI Integration)
+    // ============================================================================
+
+    // Code analysis and RAG endpoints
+    this.fastify.post('/api/agentic/code/index', this.handleCodeIndex.bind(this));
+    this.fastify.post('/api/agentic/code/query', this.handleCodeQuery.bind(this));
+    this.fastify.get('/api/agentic/code/parse', this.handleCodeParse.bind(this));
+
+    // ReAct Agent endpoints
+    this.fastify.post('/api/agentic/agent/run', this.handleRunAgent.bind(this));
+    this.fastify.get('/api/agentic/agent/:id/status', this.handleAgentStatusAgentic.bind(this));
+    this.fastify.post('/api/agentic/agent/:id/stop', this.handleStopAgent.bind(this));
+    this.fastify.post('/api/agentic/agent/:id/pause', this.handlePauseAgent.bind(this));
+    this.fastify.post('/api/agentic/agent/:id/resume', this.handleResumeAgent.bind(this));
+
+    // Deep Research endpoints
+    this.fastify.post('/api/agentic/research', this.handleDeepResearch.bind(this));
+    this.fastify.post('/api/agentic/research/stop', this.handleStopResearch.bind(this));
+    this.fastify.get('/api/agentic/research/:id/status', this.handleResearchStatus.bind(this));
+
+    // Tool parsing endpoints (Cline-style XML)
+    this.fastify.post('/api/agentic/tools/parse', this.handleParseToolCalls.bind(this));
+    this.fastify.get('/api/agentic/tools/available', this.handleGetAvailableTools.bind(this));
+    this.fastify.post('/api/agentic/tools/format', this.handleFormatToolCall.bind(this));
+
     // WebSocket for real-time communication
-    this.fastify.register(async (fastify) => {
+    this.fastify.register(async fastify => {
       fastify.get('/ws', { websocket: true }, this.handleWebSocket.bind(this));
     });
   }
@@ -238,27 +312,26 @@ Analyze the user's command and break it down into actionable steps.`;
       const response = await this.llmManager.generate(command, {
         systemMessage,
         temperature: 0.3,
-        maxTokens: 1000
+        maxTokens: 1000,
       });
 
       // Store command in memory
-      await this.memory.storeMemory(
-        `Command: ${command}`,
-        'command',
-        { response: response.content, context }
-      );
+      await this.memory.storeMemory(`Command: ${command}`, 'command', {
+        response: response.content,
+        context,
+      });
 
       reply.send({
         success: true,
         command,
         response: response.content,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error processing command', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -283,23 +356,22 @@ Analyze the user's command and break it down into actionable steps.`;
       const currentUrl = await this.browserEngine.getCurrentUrl();
 
       // Store browsing action in memory
-      await this.memory.storeMemory(
-        `Browsed to ${url}`,
-        'browsing',
-        { title, finalUrl: currentUrl }
-      );
+      await this.memory.storeMemory(`Browsed to ${url}`, 'browsing', {
+        title,
+        finalUrl: currentUrl,
+      });
 
       reply.send({
         success: true,
         url: currentUrl,
         title,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error browsing', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -320,7 +392,7 @@ Structure your response with clear sections and citations.`;
 
       const response = await this.llmManager.generate(researchPrompt, {
         temperature: 0.2,
-        maxTokens: 2000
+        maxTokens: 2000,
       });
 
       // Store research report
@@ -336,19 +408,21 @@ Structure your response with clear sections and citations.`;
         topic,
         content: response.content,
         reportId,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error researching topic', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
   private async handleStoreMemory(
-    request: FastifyRequest<{ Body: { content: string; type: string; metadata?: any; importance?: number } }>,
+    request: FastifyRequest<{
+      Body: { content: string; type: string; metadata?: any; importance?: number };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
@@ -359,13 +433,13 @@ Structure your response with clear sections and citations.`;
       reply.send({
         success: true,
         memoryId,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error storing memory', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -383,13 +457,13 @@ Structure your response with clear sections and citations.`;
         success: true,
         query: q,
         results: memories,
-        count: memories.length
+        count: memories.length,
       });
     } catch (error) {
       this.logger.error('Error searching memories', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -400,36 +474,52 @@ Structure your response with clear sections and citations.`;
 
       reply.send({
         success: true,
-        stats
+        stats,
       });
     } catch (error) {
       this.logger.error('Error getting memory stats', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
   private async handleStoreSkill(
-    request: FastifyRequest<{ Body: { name: string; description: string; content: string; type: string; confidence?: number; metadata?: any } }>,
+    request: FastifyRequest<{
+      Body: {
+        name: string;
+        description: string;
+        content: string;
+        type: string;
+        confidence?: number;
+        metadata?: any;
+      };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
       const { name, description, content, type, confidence = 0.5, metadata } = request.body;
 
-      const skillId = await this.memory.storeSkill(name, description, content, type, confidence, metadata);
+      const skillId = await this.memory.storeSkill(
+        name,
+        description,
+        content,
+        type,
+        confidence,
+        metadata
+      );
 
       reply.send({
         success: true,
         skillId,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error storing skill', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -447,13 +537,13 @@ Structure your response with clear sections and citations.`;
         success: true,
         query: q,
         results: skills,
-        count: skills.length
+        count: skills.length,
       });
     } catch (error) {
       this.logger.error('Error searching skills', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -483,19 +573,21 @@ Structure your response with clear sections and citations.`;
         task,
         taskId,
         status: 'pending',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error spawning agent', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
   private async handleSpawnMultipleAgents(
-    request: FastifyRequest<{ Body: { agents: Array<{ type: string; task: string; config?: any }> } }>,
+    request: FastifyRequest<{
+      Body: { agents: Array<{ type: string; task: string; config?: any }> };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
@@ -518,7 +610,7 @@ Structure your response with clear sections and citations.`;
           agentType: agent.type,
           task: agent.task,
           taskId,
-          status: 'pending'
+          status: 'pending',
         });
       }
 
@@ -526,13 +618,13 @@ Structure your response with clear sections and citations.`;
         success: true,
         agents: results,
         count: results.length,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error spawning multiple agents', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -543,13 +635,13 @@ Structure your response with clear sections and citations.`;
       reply.send({
         success: true,
         agents: [],
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error getting agent status', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -561,13 +653,13 @@ Structure your response with clear sections and citations.`;
         success: true,
         status: 'active',
         lastActivity: new Date().toISOString(),
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error getting heartbeat status', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -582,23 +674,22 @@ Structure your response with clear sections and citations.`;
       this.logger.info(`Triggering learning${topic ? ` for topic: ${topic}` : ''}`);
 
       // Store learning trigger
-      await this.memory.storeHeartbeat(
-        'learning_trigger',
-        'triggered',
-        { topic, timestamp: new Date().toISOString() }
-      );
+      await this.memory.storeHeartbeat('learning_trigger', 'triggered', {
+        topic,
+        timestamp: new Date().toISOString(),
+      });
 
       reply.send({
         success: true,
         action: 'learning_triggered',
         topic,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error triggering learning', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -613,31 +704,40 @@ Structure your response with clear sections and citations.`;
       this.logger.info(`Triggering browsing${url ? ` to: ${url}` : ' (random)'}`);
 
       // Store browsing trigger
-      await this.memory.storeHeartbeat(
-        'browsing_trigger',
-        'triggered',
-        { url, strategy, timestamp: new Date().toISOString() }
-      );
+      await this.memory.storeHeartbeat('browsing_trigger', 'triggered', {
+        url,
+        strategy,
+        timestamp: new Date().toISOString(),
+      });
 
       reply.send({
         success: true,
         action: 'browsing_triggered',
         url,
         strategy,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error triggering browsing', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
   // Agent management handlers
   private async handleCreateAgent(
-    request: FastifyRequest<{ Body: { name: string; type: string; modelConfig: any; capabilities: string[]; parentAgentId?: string; metadata?: any } }>,
+    request: FastifyRequest<{
+      Body: {
+        name: string;
+        type: string;
+        modelConfig: any;
+        capabilities: string[];
+        parentAgentId?: string;
+        metadata?: any;
+      };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
@@ -651,25 +751,25 @@ Structure your response with clear sections and citations.`;
         modelConfig,
         capabilities,
         parentAgentId,
-        metadata
+        metadata,
       });
 
       this.wsEventManager.broadcast({
         type: 'agent:created',
         data: agent,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
         success: true,
         agent,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error creating agent', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -683,20 +783,20 @@ Structure your response with clear sections and citations.`;
 
       const agents = await this.agentManager.listAgents({
         type: type as any,
-        status: status as any
+        status: status as any,
       });
 
       reply.send({
         success: true,
         agents,
         count: agents.length,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error listing agents', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -713,7 +813,7 @@ Structure your response with clear sections and citations.`;
       if (!agent) {
         reply.code(404).send({
           success: false,
-          error: 'Agent not found'
+          error: 'Agent not found',
         });
         return;
       }
@@ -721,19 +821,22 @@ Structure your response with clear sections and citations.`;
       reply.send({
         success: true,
         agent,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error getting agent', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
   private async handleUpdateAgent(
-    request: FastifyRequest<{ Params: { id: string }; Body: { name?: string; status?: string; capabilities?: string[]; metadata?: any } }>,
+    request: FastifyRequest<{
+      Params: { id: string };
+      Body: { name?: string; status?: string; capabilities?: string[]; metadata?: any };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
@@ -745,19 +848,19 @@ Structure your response with clear sections and citations.`;
       this.wsEventManager.broadcast({
         type: 'agent:updated',
         data: agent,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
         success: true,
         agent,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error updating agent', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -774,24 +877,27 @@ Structure your response with clear sections and citations.`;
       this.wsEventManager.broadcast({
         type: 'agent:deleted',
         data: { id },
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
         success: true,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error deleting agent', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
   private async handleSetAgentModel(
-    request: FastifyRequest<{ Params: { id: string }; Body: { provider: string; modelId: string; parameters: any } }>,
+    request: FastifyRequest<{
+      Params: { id: string };
+      Body: { provider: string; modelId: string; parameters: any };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
@@ -803,26 +909,28 @@ Structure your response with clear sections and citations.`;
       this.wsEventManager.broadcast({
         type: 'agent:updated',
         data: agent,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
         success: true,
         agent,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error setting agent model', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
   // Task management handlers
   private async handleCreateTask(
-    request: FastifyRequest<{ Body: { agentId: string; description: string; priority?: string; metadata?: any } }>,
+    request: FastifyRequest<{
+      Body: { agentId: string; description: string; priority?: string; metadata?: any };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
@@ -832,31 +940,33 @@ Structure your response with clear sections and citations.`;
         agentId,
         description,
         priority: priority as any,
-        metadata
+        metadata,
       });
 
       this.wsEventManager.broadcast({
         type: 'task:created',
         data: task,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
         success: true,
         task,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error creating task', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
   private async handleListTasks(
-    request: FastifyRequest<{ Querystring: { agentId?: string; status?: string; priority?: string } }>,
+    request: FastifyRequest<{
+      Querystring: { agentId?: string; status?: string; priority?: string };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
@@ -865,20 +975,20 @@ Structure your response with clear sections and citations.`;
       const tasks = await this.taskOrchestrator.listTasks({
         agentId,
         status: status as any,
-        priority: priority as any
+        priority: priority as any,
       });
 
       reply.send({
         success: true,
         tasks,
         count: tasks.length,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error listing tasks', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -895,7 +1005,7 @@ Structure your response with clear sections and citations.`;
       if (!task) {
         reply.code(404).send({
           success: false,
-          error: 'Task not found'
+          error: 'Task not found',
         });
         return;
       }
@@ -903,19 +1013,22 @@ Structure your response with clear sections and citations.`;
       reply.send({
         success: true,
         task,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error getting task', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
   private async handleUpdateTask(
-    request: FastifyRequest<{ Params: { id: string }; Body: { status?: string; result?: any; error?: string } }>,
+    request: FastifyRequest<{
+      Params: { id: string };
+      Body: { status?: string; result?: any; error?: string };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
@@ -927,19 +1040,19 @@ Structure your response with clear sections and citations.`;
       this.wsEventManager.broadcast({
         type: 'task:updated',
         data: task,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
         success: true,
         task,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error updating task', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -956,18 +1069,18 @@ Structure your response with clear sections and citations.`;
       this.wsEventManager.broadcast({
         type: 'task:deleted',
         data: { id },
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
         success: true,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error deleting task', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -985,28 +1098,25 @@ Structure your response with clear sections and citations.`;
       this.wsEventManager.broadcast({
         type: 'task:updated',
         data: task,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
         success: true,
         task,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error assigning task', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
   // Model handlers
-  private async handleListModels(
-    request: FastifyRequest,
-    reply: FastifyReply
-  ): Promise<void> {
+  private async handleListModels(request: FastifyRequest, reply: FastifyReply): Promise<void> {
     try {
       const models = await this.modelRouter.listAvailableModels();
 
@@ -1014,13 +1124,13 @@ Structure your response with clear sections and citations.`;
         success: true,
         models,
         count: models.length,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error listing models', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1037,13 +1147,13 @@ Structure your response with clear sections and citations.`;
       reply.send({
         success: true,
         result,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error validating model', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1061,13 +1171,13 @@ Structure your response with clear sections and citations.`;
       reply.send({
         success: true,
         session,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error creating chat session', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1085,13 +1195,13 @@ Structure your response with clear sections and citations.`;
         success: true,
         sessions,
         count: sessions.length,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error listing chat sessions', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1108,7 +1218,7 @@ Structure your response with clear sections and citations.`;
       if (!session) {
         reply.code(404).send({
           success: false,
-          error: 'Session not found'
+          error: 'Session not found',
         });
         return;
       }
@@ -1116,13 +1226,13 @@ Structure your response with clear sections and citations.`;
       reply.send({
         success: true,
         session,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error getting chat session', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1140,19 +1250,19 @@ Structure your response with clear sections and citations.`;
       this.wsEventManager.broadcast({
         type: 'chat:message',
         data: message,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
         success: true,
         message,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error sending chat message', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1168,13 +1278,13 @@ Structure your response with clear sections and citations.`;
 
       reply.send({
         success: true,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error deleting chat session', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1196,13 +1306,13 @@ Structure your response with clear sections and citations.`;
         ok: true,
         profile: profile || snapshot.status?.profile || null,
         snapshot,
-        docsUrl: 'https://docs.openclaw.ai/tools/browser'
+        docsUrl: 'https://docs.openclaw.ai/tools/browser',
       });
     } catch (error) {
       this.logger.error('Error getting browser relay status', error);
       reply.code(500).send({
         ok: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1225,13 +1335,13 @@ Structure your response with clear sections and citations.`;
         ok: true,
         action,
         result,
-        snapshot
+        snapshot,
       });
     } catch (error) {
       this.logger.error(`Error performing browser relay action: ${request.body.action}`, error);
       reply.code(500).send({
         ok: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1253,17 +1363,21 @@ Structure your response with clear sections and citations.`;
           running: isLaunched,
           tabCount: isLaunched ? 1 : 0,
           isDefault: true,
-          isRemote: false
-        }
+          isRemote: false,
+        },
       ];
 
       // Get tabs info
-      const tabs = isLaunched ? [{
-        targetId: 'page-1',
-        title: title || 'Browser Page',
-        url: currentUrl || '',
-        id: 'page-1'
-      }] : [];
+      const tabs = isLaunched
+        ? [
+            {
+              targetId: 'page-1',
+              title: title || 'Browser Page',
+              url: currentUrl || '',
+              id: 'page-1',
+            },
+          ]
+        : [];
 
       // Extension status (not applicable for our implementation)
       const extension = {
@@ -1273,7 +1387,7 @@ Structure your response with clear sections and citations.`;
         installed: false,
         manifestName: null,
         manifestVersion: null,
-        error: 'Extension mode not supported in OpenBro247'
+        error: 'Extension mode not supported in OpenBro247',
       };
 
       // Health status
@@ -1282,7 +1396,7 @@ Structure your response with clear sections and citations.`;
         running: isLaunched,
         cdpReady: isLaunched,
         tabConnected: isLaunched,
-        relayReady: isLaunched
+        relayReady: isLaunched,
       };
 
       return {
@@ -1301,7 +1415,7 @@ Structure your response with clear sections and citations.`;
           detectError: null,
           attachOnly: false,
           headless: false,
-          color: '#4285f4'
+          color: '#4285f4',
         },
         profiles,
         tabs,
@@ -1310,8 +1424,8 @@ Structure your response with clear sections and citations.`;
         errors: {
           status: null,
           profiles: null,
-          tabs: null
-        }
+          tabs: null,
+        },
       };
     } catch (error) {
       this.logger.error('Error getting browser relay snapshot', error);
@@ -1326,28 +1440,34 @@ Structure your response with clear sections and citations.`;
           installed: false,
           manifestName: null,
           manifestVersion: null,
-          error: error instanceof Error ? error.message : 'Unknown error'
+          error: error instanceof Error ? error.message : 'Unknown error',
         },
         health: {
           installed: false,
           running: false,
           cdpReady: false,
           tabConnected: false,
-          relayReady: false
+          relayReady: false,
         },
         errors: {
           status: error instanceof Error ? error.message : 'Unknown error',
           profiles: null,
-          tabs: null
-        }
+          tabs: null,
+        },
       };
     }
   }
 
-  private async performBrowserRelayAction(action: string, profile?: string, payload: any = {}): Promise<any> {
+  private async performBrowserRelayAction(
+    action: string,
+    profile?: string,
+    payload: any = {}
+  ): Promise<any> {
     switch (action) {
       case 'install-extension':
-        return { message: 'Extension installation not supported in OpenBro247. Use managed browser mode.' };
+        return {
+          message: 'Extension installation not supported in OpenBro247. Use managed browser mode.',
+        };
 
       case 'start':
         if (!this.browserEngine.isLaunched()) {
@@ -1368,15 +1488,16 @@ Structure your response with clear sections and citations.`;
         await this.browserEngine.launch();
         return { message: 'Browser restarted successfully' };
 
-      case 'open-test-tab':
+      case 'open-test-tab': {
         if (!this.browserEngine.isLaunched()) {
           await this.browserEngine.launch();
         }
         const url = payload.url || 'https://example.com';
         await this.browserEngine.navigate(url);
         return { message: `Opened test tab: ${url}` };
+      }
 
-      case 'snapshot-test':
+      case 'snapshot-test': {
         if (!this.browserEngine.isLaunched()) {
           throw new Error('Browser not running');
         }
@@ -1385,18 +1506,20 @@ Structure your response with clear sections and citations.`;
         return {
           message: 'Browser connection test successful',
           url: currentUrl,
-          title
+          title,
         };
+      }
 
-      case 'screenshot':
+      case 'screenshot': {
         if (!this.browserEngine.isLaunched()) {
           throw new Error('Browser not running');
         }
         const screenshot = await this.browserEngine.takeScreenshot();
         return {
           message: 'Screenshot captured',
-          image: screenshot
+          image: screenshot,
         };
+      }
 
       default:
         throw new Error(`Unknown action: ${action}`);
@@ -1410,51 +1533,60 @@ Structure your response with clear sections and citations.`;
       // For now, return mock browser session data that matches Mission Control expectations
       const mockSessions = [
         {
-          id: "session-1",
-          agentId: "main",
-          url: this.browserEngine.isLaunched() ? await this.browserEngine.getCurrentUrl() : "https://example.com",
+          id: 'session-1',
+          agentId: 'main',
+          url: this.browserEngine.isLaunched()
+            ? await this.browserEngine.getCurrentUrl()
+            : 'https://example.com',
           startTime: Date.now() - 2 * 60 * 60 * 1000, // 2 hours ago
           endTime: null,
-          status: this.browserEngine.isLaunched() ? "active" : "completed",
-          actions: this.browserEngine.isLaunched() ? [
-            {
-              type: "navigate",
-              target: this.browserEngine.isLaunched() ? await this.browserEngine.getCurrentUrl() : "https://example.com",
-              timestamp: Date.now() - 2 * 60 * 60 * 1000,
-              success: true,
-              mcpPrecision: 95,
-              playwrightPrecision: 98,
-              duration: 1200
-            },
-            {
-              type: "scroll",
-              timestamp: Date.now() - 2 * 60 * 60 * 1000 + 30000,
-              success: true,
-              mcpPrecision: 88,
-              playwrightPrecision: 95,
-              duration: 800
-            }
-          ] : []
-        }
+          status: this.browserEngine.isLaunched() ? 'active' : 'completed',
+          actions: this.browserEngine.isLaunched()
+            ? [
+                {
+                  type: 'navigate',
+                  target: this.browserEngine.isLaunched()
+                    ? await this.browserEngine.getCurrentUrl()
+                    : 'https://example.com',
+                  timestamp: Date.now() - 2 * 60 * 60 * 1000,
+                  success: true,
+                  mcpPrecision: 95,
+                  playwrightPrecision: 98,
+                  duration: 1200,
+                },
+                {
+                  type: 'scroll',
+                  timestamp: Date.now() - 2 * 60 * 60 * 1000 + 30000,
+                  success: true,
+                  mcpPrecision: 88,
+                  playwrightPrecision: 95,
+                  duration: 800,
+                },
+              ]
+            : [],
+        },
       ];
 
       reply.send({
         success: true,
         sessions: mockSessions,
         count: mockSessions.length,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error getting browser sessions', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
   // Additional browser endpoints for Mission Control compatibility
-  private async handleBrowserStatus(request: FastifyRequest<{ Querystring: { profile?: string } }>, reply: FastifyReply): Promise<void> {
+  private async handleBrowserStatus(
+    request: FastifyRequest<{ Querystring: { profile?: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
     try {
       const { profile } = request.query;
       this.logger.info(`Getting browser status for profile: ${profile || 'default'}`);
@@ -1476,7 +1608,7 @@ Structure your response with clear sections and citations.`;
         detectError: null,
         attachOnly: false,
         headless: false,
-        color: '#4285f4'
+        color: '#4285f4',
       });
     } catch (error) {
       this.logger.error('Error getting browser status', error);
@@ -1484,7 +1616,7 @@ Structure your response with clear sections and citations.`;
         enabled: false,
         running: false,
         cdpReady: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1503,44 +1635,54 @@ Structure your response with clear sections and citations.`;
             running: this.browserEngine.isLaunched(),
             tabCount: this.browserEngine.isLaunched() ? 1 : 0,
             isDefault: true,
-            isRemote: false
-          }
-        ]
+            isRemote: false,
+          },
+        ],
       });
     } catch (error) {
       this.logger.error('Error getting browser profiles', error);
       reply.code(500).send({
         profiles: [],
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
-  private async handleBrowserTabs(request: FastifyRequest<{ Querystring: { profile?: string } }>, reply: FastifyReply): Promise<void> {
+  private async handleBrowserTabs(
+    request: FastifyRequest<{ Querystring: { profile?: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
     try {
       const { profile } = request.query;
       this.logger.info(`Getting browser tabs for profile: ${profile || 'default'}`);
 
-      const tabs = this.browserEngine.isLaunched() ? [{
-        targetId: 'page-1',
-        title: await this.browserEngine.getTitle(),
-        url: await this.browserEngine.getCurrentUrl(),
-        id: 'page-1'
-      }] : [];
+      const tabs = this.browserEngine.isLaunched()
+        ? [
+            {
+              targetId: 'page-1',
+              title: await this.browserEngine.getTitle(),
+              url: await this.browserEngine.getCurrentUrl(),
+              id: 'page-1',
+            },
+          ]
+        : [];
 
       reply.send({
-        tabs
+        tabs,
       });
     } catch (error) {
       this.logger.error('Error getting browser tabs', error);
       reply.code(500).send({
         tabs: [],
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
-  private async handleBrowserStart(request: FastifyRequest<{ Body: { profile?: string } }>, reply: FastifyReply): Promise<void> {
+  private async handleBrowserStart(
+    request: FastifyRequest<{ Body: { profile?: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
     try {
       const { profile } = request.body;
       this.logger.info(`Starting browser for profile: ${profile || 'default'}`);
@@ -1550,17 +1692,20 @@ Structure your response with clear sections and citations.`;
       }
 
       reply.send({
-        message: 'Browser started successfully'
+        message: 'Browser started successfully',
       });
     } catch (error) {
       this.logger.error('Error starting browser', error);
       reply.code(500).send({
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
-  private async handleBrowserStop(request: FastifyRequest<{ Body: { profile?: string } }>, reply: FastifyReply): Promise<void> {
+  private async handleBrowserStop(
+    request: FastifyRequest<{ Body: { profile?: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
     try {
       const { profile } = request.body;
       this.logger.info(`Stopping browser for profile: ${profile || 'default'}`);
@@ -1570,17 +1715,20 @@ Structure your response with clear sections and citations.`;
       }
 
       reply.send({
-        message: 'Browser stopped successfully'
+        message: 'Browser stopped successfully',
       });
     } catch (error) {
       this.logger.error('Error stopping browser', error);
       reply.code(500).send({
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
-  private async handleBrowserSnapshot(request: FastifyRequest<{ Querystring: { profile?: string } }>, reply: FastifyReply): Promise<void> {
+  private async handleBrowserSnapshot(
+    request: FastifyRequest<{ Querystring: { profile?: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
     try {
       const { profile } = request.query;
       this.logger.info(`Getting browser snapshot for profile: ${profile || 'default'}`);
@@ -1590,11 +1738,15 @@ Structure your response with clear sections and citations.`;
       reply.send({
         running: isLaunched,
         cdpReady: isLaunched,
-        tabs: isLaunched ? [{
-          targetId: 'page-1',
-          title: await this.browserEngine.getTitle(),
-          url: await this.browserEngine.getCurrentUrl()
-        }] : []
+        tabs: isLaunched
+          ? [
+              {
+                targetId: 'page-1',
+                title: await this.browserEngine.getTitle(),
+                url: await this.browserEngine.getCurrentUrl(),
+              },
+            ]
+          : [],
       });
     } catch (error) {
       this.logger.error('Error getting browser snapshot', error);
@@ -1602,19 +1754,22 @@ Structure your response with clear sections and citations.`;
         running: false,
         cdpReady: false,
         tabs: [],
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 
-  private async handleBrowserScreenshot(request: FastifyRequest<{ Body: { profile?: string; format?: string; fullPage?: boolean } }>, reply: FastifyReply): Promise<void> {
+  private async handleBrowserScreenshot(
+    request: FastifyRequest<{ Body: { profile?: string; format?: string; fullPage?: boolean } }>,
+    reply: FastifyReply
+  ): Promise<void> {
     try {
       const { profile, format = 'png', fullPage = false } = request.body;
       this.logger.info(`Taking browser screenshot for profile: ${profile || 'default'}`);
 
       if (!this.browserEngine.isLaunched()) {
         reply.code(400).send({
-          error: 'Browser not running'
+          error: 'Browser not running',
         });
         return;
       }
@@ -1624,12 +1779,12 @@ Structure your response with clear sections and citations.`;
       reply.send({
         image: screenshot,
         format,
-        fullPage
+        fullPage,
       });
     } catch (error) {
       this.logger.error('Error taking browser screenshot', error);
       reply.code(500).send({
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1643,11 +1798,13 @@ Structure your response with clear sections and citations.`;
         this.logger.info('WebSocket message received', data);
 
         // Echo back for now - in full implementation this would handle real-time commands
-        connection.socket.send(JSON.stringify({
-          type: 'echo',
-          data,
-          timestamp: new Date().toISOString()
-        }));
+        connection.socket.send(
+          JSON.stringify({
+            type: 'echo',
+            data,
+            timestamp: new Date().toISOString(),
+          })
+        );
       } catch (error) {
         this.logger.error('Error handling WebSocket message', error);
       }
@@ -1669,31 +1826,42 @@ Structure your response with clear sections and citations.`;
       reply.send({
         success: true,
         context,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error getting computer context', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Failed to get computer context'
+        error: error instanceof Error ? error.message : 'Failed to get computer context',
       });
     }
   }
 
   private async handleExecuteOperation(
-    request: FastifyRequest<{ Body: { type: string; target?: string; parameters?: any; description?: string } }>,
+    request: FastifyRequest<{
+      Body: { type: string; target?: string; parameters?: any; description?: string };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
       const { type, target, parameters, description } = request.body;
 
       // Validate operation type
-      const validTypes = ['open_application', 'close_application', 'navigate_web', 'take_screenshot',
-                         'type_text', 'click_element', 'edit_file', 'run_command', 'monitor_screen'];
+      const validTypes = [
+        'open_application',
+        'close_application',
+        'navigate_web',
+        'take_screenshot',
+        'type_text',
+        'click_element',
+        'edit_file',
+        'run_command',
+        'monitor_screen',
+      ];
       if (!validTypes.includes(type)) {
         return reply.code(400).send({
           success: false,
-          error: `Invalid operation type: ${type}`
+          error: `Invalid operation type: ${type}`,
         });
       }
 
@@ -1703,37 +1871,46 @@ Structure your response with clear sections and citations.`;
       this.wsEventManager.broadcast({
         type: 'computer:operation_completed',
         data: { operation, result },
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
         success: true,
         operation,
         result,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error executing computer operation', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Failed to execute computer operation'
+        error: error instanceof Error ? error.message : 'Failed to execute computer operation',
       });
     }
   }
 
   private async handleExecuteComputerTask(
-    request: FastifyRequest<{ Body: { id: string; description: string; type: string; priority?: string } }>,
+    request: FastifyRequest<{
+      Body: { id: string; description: string; type: string; priority?: string };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
       const { id, description, type, priority } = request.body;
 
       // Validate task type
-      const validTaskTypes = ['web_navigation', 'research', 'monitoring', 'coding_task', 'desktop_operation', 'complex_workflow'];
+      const validTaskTypes = [
+        'web_navigation',
+        'research',
+        'monitoring',
+        'coding_task',
+        'desktop_operation',
+        'complex_workflow',
+      ];
       if (!validTaskTypes.includes(type)) {
         return reply.code(400).send({
           success: false,
-          error: `Invalid task type: ${type}`
+          error: `Invalid task type: ${type}`,
         });
       }
 
@@ -1743,7 +1920,7 @@ Structure your response with clear sections and citations.`;
       if (!validPriorities.includes(taskPriority)) {
         return reply.code(400).send({
           success: false,
-          error: `Invalid priority: ${taskPriority}`
+          error: `Invalid priority: ${taskPriority}`,
         });
       }
 
@@ -1753,7 +1930,7 @@ Structure your response with clear sections and citations.`;
         type: type as any,
         status: 'pending' as const,
         priority: taskPriority as any,
-        createdAt: new Date()
+        createdAt: new Date(),
       };
 
       const result = await this.computerOrchestrator.executeComputerTask(task);
@@ -1761,20 +1938,20 @@ Structure your response with clear sections and citations.`;
       this.wsEventManager.broadcast({
         type: 'computer:task_completed',
         data: { task, result },
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
         success: true,
         task,
         result,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error executing computer task', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Failed to execute computer task'
+        error: error instanceof Error ? error.message : 'Failed to execute computer task',
       });
     }
   }
@@ -1790,7 +1967,7 @@ Structure your response with clear sections and citations.`;
       if (!digitalOperator) {
         return reply.code(404).send({
           success: false,
-          error: `Digital operator '${operator}' not found`
+          error: `Digital operator '${operator}' not found`,
         });
       }
 
@@ -1799,7 +1976,7 @@ Structure your response with clear sections and citations.`;
       this.wsEventManager.broadcast({
         type: 'computer:command_processed',
         data: { command, operator, result },
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
 
       reply.send({
@@ -1807,13 +1984,13 @@ Structure your response with clear sections and citations.`;
         command,
         operator,
         result,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error processing natural command', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Failed to process natural command'
+        error: error instanceof Error ? error.message : 'Failed to process natural command',
       });
     }
   }
@@ -1825,20 +2002,20 @@ Structure your response with clear sections and citations.`;
     try {
       const operators = Array.from(this.digitalOperators.entries()).map(([key, operator]) => ({
         key,
-        status: operator.getStatus()
+        status: operator.getStatus(),
       }));
 
       reply.send({
         success: true,
         operators,
         count: operators.length,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error listing digital operators', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Failed to list digital operators'
+        error: error instanceof Error ? error.message : 'Failed to list digital operators',
       });
     }
   }
@@ -1854,7 +2031,7 @@ Structure your response with clear sections and citations.`;
       if (!operator) {
         return reply.code(404).send({
           success: false,
-          error: `Digital operator '${name}' not found`
+          error: `Digital operator '${name}' not found`,
         });
       }
 
@@ -1864,13 +2041,13 @@ Structure your response with clear sections and citations.`;
         success: true,
         name,
         status,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error getting operator status', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Failed to get operator status'
+        error: error instanceof Error ? error.message : 'Failed to get operator status',
       });
     }
   }
@@ -1884,12 +2061,12 @@ Structure your response with clear sections and citations.`;
 
       const options = {
         format: format as 'png' | 'jpeg',
-        quality: quality ? parseInt(quality) : undefined
+        quality: quality ? parseInt(quality) : undefined,
       };
 
       const result = await this.computerOrchestrator.executeHighLevelOperation({
         type: 'take_screenshot',
-        parameters: options
+        parameters: options,
       });
 
       if (result.success && result.data?.screenshot) {
@@ -1898,14 +2075,14 @@ Structure your response with clear sections and citations.`;
       } else {
         reply.code(500).send({
           success: false,
-          error: 'Failed to capture screenshot'
+          error: 'Failed to capture screenshot',
         });
       }
     } catch (error) {
       this.logger.error('Error getting screenshot', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Failed to get screenshot'
+        error: error instanceof Error ? error.message : 'Failed to get screenshot',
       });
     }
   }
@@ -1916,15 +2093,15 @@ Structure your response with clear sections and citations.`;
       name: 'navigate_to',
       description: 'Navigate the browser to a specific URL',
       parameters: [
-        { name: 'url', type: 'string', description: 'The URL to navigate to', required: true }
+        { name: 'url', type: 'string', description: 'The URL to navigate to', required: true },
       ],
-      handler: async (params) => {
+      handler: async params => {
         await this.browserEngine.navigate(params.url);
-        return { 
+        return {
           message: `Navigated to ${params.url}`,
-          title: await this.browserEngine.getTitle()
+          title: await this.browserEngine.getTitle(),
         };
-      }
+      },
     });
 
     // Register basic extraction skill
@@ -1932,15 +2109,20 @@ Structure your response with clear sections and citations.`;
       name: 'extract_text',
       description: 'Extract text content from the current page',
       parameters: [
-        { name: 'selector', type: 'string', description: 'CSS selector to extract from (optional, defaults to body)', required: false }
+        {
+          name: 'selector',
+          type: 'string',
+          description: 'CSS selector to extract from (optional, defaults to body)',
+          required: false,
+        },
       ],
-      handler: async (params) => {
+      handler: async params => {
         const selector = params.selector || 'body';
         const text = await this.browserEngine.extractText(selector);
         return { text };
-      }
+      },
     });
-    
+
     this.logger.info(`Registered ${this.skillRegistry.getAllSkills().length} default skills`);
   }
 
@@ -1958,13 +2140,13 @@ Structure your response with clear sections and citations.`;
         skill,
         result: result.result,
         error: result.error,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error('Error executing skill', error);
       reply.code(500).send({
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
@@ -1974,7 +2156,10 @@ Structure your response with clear sections and citations.`;
   // ──────────────────────────────────────────────
 
   private async handleExecuteAgent(
-    request: FastifyRequest<{ Params: { id: string }; Body: { goal: string; maxIterations?: number; enableMemory?: boolean } }>,
+    request: FastifyRequest<{
+      Params: { id: string };
+      Body: { goal: string; maxIterations?: number; enableMemory?: boolean };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
@@ -2027,7 +2212,7 @@ Structure your response with clear sections and citations.`;
           error: execution.error,
           iterations: execution.iterations,
           tokensUsed: execution.tokensUsed,
-          steps: execution.plan.steps.map((s) => ({
+          steps: execution.plan.steps.map(s => ({
             id: s.id,
             tool: s.tool,
             thought: s.thought,
@@ -2058,7 +2243,9 @@ Structure your response with clear sections and citations.`;
       const executions = this.agentRuntime.getActiveExecutions();
       reply.send({ success: true, executions, count: executions.length });
     } catch (error) {
-      reply.code(500).send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+      reply
+        .code(500)
+        .send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -2067,7 +2254,15 @@ Structure your response with clear sections and citations.`;
   // ──────────────────────────────────────────────
 
   private async handleCreateCronJob(
-    request: FastifyRequest<{ Body: { name: string; schedule: string; command: string; agentId?: string; description?: string } }>,
+    request: FastifyRequest<{
+      Body: {
+        name: string;
+        schedule: string;
+        command: string;
+        agentId?: string;
+        description?: string;
+      };
+    }>,
     reply: FastifyReply
   ): Promise<void> {
     try {
@@ -2076,10 +2271,16 @@ Structure your response with clear sections and citations.`;
         return;
       }
       const job = await this.cronScheduler.createJob(request.body);
-      this.wsEventManager.broadcast({ type: 'cron:created', data: job, timestamp: new Date().toISOString() });
+      this.wsEventManager.broadcast({
+        type: 'cron:created',
+        data: job,
+        timestamp: new Date().toISOString(),
+      });
       reply.send({ success: true, job, timestamp: new Date().toISOString() });
     } catch (error) {
-      reply.code(500).send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+      reply
+        .code(500)
+        .send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -2088,7 +2289,9 @@ Structure your response with clear sections and citations.`;
       const jobs = this.cronScheduler ? await this.cronScheduler.listJobs() : [];
       reply.send({ success: true, jobs, count: jobs.length });
     } catch (error) {
-      reply.code(500).send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+      reply
+        .code(500)
+        .send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -2097,11 +2300,16 @@ Structure your response with clear sections and citations.`;
     reply: FastifyReply
   ): Promise<void> {
     try {
-      if (!this.cronScheduler) { reply.code(503).send({ success: false, error: 'Cron scheduler not initialized' }); return; }
+      if (!this.cronScheduler) {
+        reply.code(503).send({ success: false, error: 'Cron scheduler not initialized' });
+        return;
+      }
       await this.cronScheduler.pauseJob(request.params.id);
       reply.send({ success: true, timestamp: new Date().toISOString() });
     } catch (error) {
-      reply.code(500).send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+      reply
+        .code(500)
+        .send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -2110,11 +2318,16 @@ Structure your response with clear sections and citations.`;
     reply: FastifyReply
   ): Promise<void> {
     try {
-      if (!this.cronScheduler) { reply.code(503).send({ success: false, error: 'Cron scheduler not initialized' }); return; }
+      if (!this.cronScheduler) {
+        reply.code(503).send({ success: false, error: 'Cron scheduler not initialized' });
+        return;
+      }
       await this.cronScheduler.resumeJob(request.params.id);
       reply.send({ success: true, timestamp: new Date().toISOString() });
     } catch (error) {
-      reply.code(500).send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+      reply
+        .code(500)
+        .send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -2123,11 +2336,16 @@ Structure your response with clear sections and citations.`;
     reply: FastifyReply
   ): Promise<void> {
     try {
-      if (!this.cronScheduler) { reply.code(503).send({ success: false, error: 'Cron scheduler not initialized' }); return; }
+      if (!this.cronScheduler) {
+        reply.code(503).send({ success: false, error: 'Cron scheduler not initialized' });
+        return;
+      }
       const run = await this.cronScheduler.triggerJob(request.params.id);
       reply.send({ success: true, run, timestamp: new Date().toISOString() });
     } catch (error) {
-      reply.code(500).send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+      reply
+        .code(500)
+        .send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -2136,11 +2354,16 @@ Structure your response with clear sections and citations.`;
     reply: FastifyReply
   ): Promise<void> {
     try {
-      if (!this.cronScheduler) { reply.code(503).send({ success: false, error: 'Cron scheduler not initialized' }); return; }
+      if (!this.cronScheduler) {
+        reply.code(503).send({ success: false, error: 'Cron scheduler not initialized' });
+        return;
+      }
       await this.cronScheduler.deleteJob(request.params.id);
       reply.send({ success: true, timestamp: new Date().toISOString() });
     } catch (error) {
-      reply.code(500).send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+      reply
+        .code(500)
+        .send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -2154,7 +2377,9 @@ Structure your response with clear sections and citations.`;
         : [];
       reply.send({ success: true, history, count: history.length });
     } catch (error) {
-      reply.code(500).send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+      reply
+        .code(500)
+        .send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -2172,10 +2397,19 @@ Structure your response with clear sections and citations.`;
             days: parseInt(request.query.days ?? '30'),
             agentId: request.query.agentId,
           })
-        : { totalRequests: 0, totalTokens: 0, totalCostUsd: 0, byModel: {}, byAgent: {}, byDay: {} };
+        : {
+            totalRequests: 0,
+            totalTokens: 0,
+            totalCostUsd: 0,
+            byModel: {},
+            byAgent: {},
+            byDay: {},
+          };
       reply.send({ success: true, summary });
     } catch (error) {
-      reply.code(500).send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+      reply
+        .code(500)
+        .send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
     }
   }
 
@@ -2189,7 +2423,507 @@ Structure your response with clear sections and citations.`;
         : [];
       reply.send({ success: true, entries, count: entries.length });
     } catch (error) {
-      reply.code(500).send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+      reply
+        .code(500)
+        .send({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+    }
+  }
+
+  // ──────────────────────────────────────────────
+  // Agentic AI Handlers (Web-UI, Cline, Code-Assistant-AI)
+  // ──────────────────────────────────────────────
+
+  private async handleCodeIndex(
+    request: FastifyRequest<{
+      Body: { repoPath: string; chunkSize?: number; chunkOverlap?: number };
+    }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const { repoPath, chunkSize, chunkOverlap } = request.body;
+
+      this.logger.info(`Indexing repository: ${repoPath}`);
+
+      this.ragChain = new RAGChain(this.modelRouter, {
+        provider: 'openrouter',
+        modelId: 'anthropic/claude-3-5-sonnet',
+        parameters: { temperature: 0.3, maxTokens: 2000 },
+      });
+
+      const result = await this.ragChain.indexRepository(repoPath, {
+        chunkSize,
+        chunkOverlap,
+      });
+
+      reply.send({
+        success: true,
+        data: {
+          chunks: result.chunks,
+          definitions: result.definitions,
+          repositoryMap: result.repositoryMap,
+        },
+      });
+    } catch (error) {
+      this.logger.error('Failed to index repository', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to index repository',
+      });
+    }
+  }
+
+  private async handleCodeQuery(
+    request: FastifyRequest<{ Body: { query: string; maxResults?: number; minScore?: number } }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      if (!this.ragChain) {
+        reply.code(400).send({
+          success: false,
+          error: 'Repository not indexed. Call /api/agentic/code/index first.',
+        });
+        return;
+      }
+
+      const { query, maxResults, minScore } = request.body;
+
+      const response = await this.ragChain.query({
+        query,
+        maxResults: maxResults ?? 8,
+        minScore: minScore ?? 0.3,
+        includeDefinitions: true,
+        includeCode: true,
+      });
+
+      reply.send({
+        success: true,
+        data: {
+          answer: response.answer,
+          sources: response.sources.map(s => ({
+            filePath: s.chunk.filePath,
+            startLine: s.chunk.startLine,
+            endLine: s.chunk.endLine,
+            content: s.chunk.content.slice(0, 500),
+            score: s.score,
+          })),
+          confidence: response.confidence,
+        },
+      });
+    } catch (error) {
+      this.logger.error('Failed to query code', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to query code',
+      });
+    }
+  }
+
+  private async handleCodeParse(
+    request: FastifyRequest<{ Querystring: { path: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const filePath = request.query.path;
+      if (!filePath) {
+        reply.code(400).send({ success: false, error: 'path query parameter required' });
+        return;
+      }
+
+      const result = await this.codeParser.parseFile(filePath);
+
+      reply.send({
+        success: true,
+        data: {
+          filePath: result.filePath,
+          language: result.language,
+          definitions: result.definitions,
+          imports: result.imports,
+          exports: result.exports,
+          complexity: result.complexity,
+          documentation: result.documentation,
+        },
+      });
+    } catch (error) {
+      this.logger.error('Failed to parse file', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to parse file',
+      });
+    }
+  }
+
+  private async handleRunAgent(
+    request: FastifyRequest<{
+      Body: {
+        task: string;
+        agentType?: 'browser' | 'coding' | 'general';
+        maxSteps?: number;
+        modelConfig: {
+          provider: string;
+          modelId: string;
+          parameters: { temperature: number; maxTokens: number };
+        };
+      };
+    }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const { task, agentType, maxSteps, modelConfig } = request.body;
+
+      let agent: ReActAgent;
+      const config = {
+        task,
+        modelConfig,
+        maxSteps: maxSteps ?? 30,
+      };
+
+      switch (agentType) {
+        case 'browser':
+          agent = this.agentFactory.createBrowserAgent(config);
+          break;
+        case 'coding':
+          agent = this.agentFactory.createCodingAgent(config);
+          break;
+        default:
+          agent = new ReActAgent(this.modelRouter, config);
+      }
+
+      const agentId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      this.activeAgents.set(agentId, agent);
+
+      // Start agent in background
+      agent
+        .run()
+        .then(() => {
+          this.logger.info(`Agent ${agentId} completed`);
+        })
+        .catch(err => {
+          this.logger.error(`Agent ${agentId} failed`, err);
+        })
+        .finally(() => {
+          // Keep agent for a while for status checks
+          setTimeout(() => this.activeAgents.delete(agentId), 300000);
+        });
+
+      this.wsEventManager.broadcast({
+        type: 'agent:started',
+        data: { agentId, task },
+        timestamp: new Date().toISOString(),
+      });
+
+      reply.send({
+        success: true,
+        data: {
+          agentId,
+          status: 'running',
+          message: 'Agent started. Use GET /api/agentic/agent/:id/status to check progress.',
+        },
+      });
+    } catch (error) {
+      this.logger.error('Failed to run agent', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to run agent',
+      });
+    }
+  }
+
+  private async handleAgentStatusAgentic(
+    request: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const agentId = request.params.id;
+      const agent = this.activeAgents.get(agentId);
+
+      if (!agent) {
+        reply.code(404).send({ success: false, error: 'Agent not found' });
+        return;
+      }
+
+      const state = agent.getState();
+      const summary = agent.getSummary();
+
+      reply.send({
+        success: true,
+        data: {
+          agentId,
+          status: state.history.status,
+          currentStep: state.step,
+          maxSteps: state.maxSteps,
+          summary,
+          lastSteps: state.history.steps.slice(-5),
+        },
+      });
+    } catch (error) {
+      this.logger.error('Failed to get agent status', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to get agent status',
+      });
+    }
+  }
+
+  private async handleStopAgent(
+    request: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const agentId = request.params.id;
+      const agent = this.activeAgents.get(agentId);
+
+      if (!agent) {
+        reply.code(404).send({ success: false, error: 'Agent not found' });
+        return;
+      }
+
+      agent.stop();
+
+      reply.send({
+        success: true,
+        data: { message: 'Stop signal sent to agent' },
+      });
+    } catch (error) {
+      this.logger.error('Failed to stop agent', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to stop agent',
+      });
+    }
+  }
+
+  private async handlePauseAgent(
+    request: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const agentId = request.params.id;
+      const agent = this.activeAgents.get(agentId);
+
+      if (!agent) {
+        reply.code(404).send({ success: false, error: 'Agent not found' });
+        return;
+      }
+
+      agent.pause();
+
+      reply.send({
+        success: true,
+        data: { message: 'Agent paused' },
+      });
+    } catch (error) {
+      this.logger.error('Failed to pause agent', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to pause agent',
+      });
+    }
+  }
+
+  private async handleResumeAgent(
+    request: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const agentId = request.params.id;
+      const agent = this.activeAgents.get(agentId);
+
+      if (!agent) {
+        reply.code(404).send({ success: false, error: 'Agent not found' });
+        return;
+      }
+
+      agent.resume();
+
+      reply.send({
+        success: true,
+        data: { message: 'Agent resumed' },
+      });
+    } catch (error) {
+      this.logger.error('Failed to resume agent', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to resume agent',
+      });
+    }
+  }
+
+  private async handleDeepResearch(
+    request: FastifyRequest<{
+      Body: { topic: string; maxParallelBrowsers?: number; outputDir?: string };
+    }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const { topic, maxParallelBrowsers, outputDir } = request.body;
+
+      this.logger.info(`Starting deep research: ${topic}`);
+
+      const result = await this.deepResearchAgent.run({
+        topic,
+        modelConfig: {
+          provider: 'openrouter',
+          modelId: 'anthropic/claude-3-5-sonnet',
+          parameters: { temperature: 0.3, maxTokens: 2000 },
+        },
+        maxParallelBrowsers,
+        outputDir,
+      });
+
+      this.wsEventManager.broadcast({
+        type: 'research:completed',
+        data: result,
+        timestamp: new Date().toISOString(),
+      });
+
+      reply.send({
+        success: true,
+        data: result,
+      });
+    } catch (error) {
+      this.logger.error('Failed to start research', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to start research',
+      });
+    }
+  }
+
+  private async handleStopResearch(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    try {
+      this.deepResearchAgent.stop();
+
+      reply.send({
+        success: true,
+        data: { message: 'Stop signal sent' },
+      });
+    } catch (error) {
+      this.logger.error('Failed to stop research', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to stop research',
+      });
+    }
+  }
+
+  private async handleResearchStatus(
+    request: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const status = this.deepResearchAgent.getStatus();
+
+      reply.send({
+        success: true,
+        data: status,
+      });
+    } catch (error) {
+      this.logger.error('Failed to get research status', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to get research status',
+      });
+    }
+  }
+
+  private async handleParseToolCalls(
+    request: FastifyRequest<{ Body: { message: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const { message } = request.body;
+
+      const blocks = this.toolParser.parse(message);
+      const toolUses = blocks.filter(b => b.type === 'tool_use');
+      const textContent = blocks.filter(b => b.type === 'text');
+
+      reply.send({
+        success: true,
+        data: {
+          blocks,
+          toolUseCount: toolUses.length,
+          textBlockCount: textContent.length,
+          hasToolCalls: toolUses.length > 0,
+        },
+      });
+    } catch (error) {
+      this.logger.error('Failed to parse tool calls', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to parse tool calls',
+      });
+    }
+  }
+
+  private async handleGetAvailableTools(
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const tools = DEFAULT_TOOLS.map(t => ({
+        name: t.name,
+        description: t.description,
+        params: t.params,
+      }));
+
+      reply.send({
+        success: true,
+        data: { tools },
+      });
+    } catch (error) {
+      this.logger.error('Failed to get tools', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to get tools',
+      });
+    }
+  }
+
+  private async handleFormatToolCall(
+    request: FastifyRequest<{ Body: { type: string; params: Record<string, string> } }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    try {
+      const { type, params } = request.body;
+      let formatted: string;
+
+      switch (type) {
+        case 'fileRead':
+          formatted = ResponseFormatter.fileRead(params.path, params.content || '');
+          break;
+        case 'fileWrite':
+          formatted = ResponseFormatter.fileWrite(params.path, params.content);
+          break;
+        case 'command':
+          formatted = ResponseFormatter.commandExecution(params.command, params.cwd);
+          break;
+        case 'completion':
+          formatted = ResponseFormatter.completion(params.result);
+          break;
+        case 'question':
+          formatted = ResponseFormatter.followUpQuestion(params.question);
+          break;
+        case 'navigate':
+          formatted = ResponseFormatter.browserNavigate(params.url);
+          break;
+        case 'screenshot':
+          formatted = ResponseFormatter.browserScreenshot();
+          break;
+        default:
+          reply.code(400).send({ success: false, error: `Unknown format type: ${type}` });
+          return;
+      }
+
+      reply.send({
+        success: true,
+        data: { formatted },
+      });
+    } catch (error) {
+      this.logger.error('Failed to format tool call', error);
+      reply.code(500).send({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to format tool call',
+      });
     }
   }
 
@@ -2211,6 +2945,13 @@ Structure your response with clear sections and citations.`;
         agentRuntime: this.agentRuntime ? 'ready' : 'not_initialized',
         cronScheduler: this.cronScheduler ? 'ready' : 'not_initialized',
         usageTracker: this.usageTracker ? 'ready' : 'not_initialized',
+        // Agentic AI systems
+        codeParser: 'ready',
+        ragChain: this.ragChain ? 'ready' : 'not_indexed',
+        agentFactory: 'ready',
+        deepResearchAgent: 'ready',
+        toolParser: 'ready',
+        activeAgents: this.activeAgents.size,
       },
       memory: memStats,
     });
@@ -2220,7 +2961,7 @@ Structure your response with clear sections and citations.`;
     try {
       await this.fastify.listen({
         host: this.config.host,
-        port: this.config.port
+        port: this.config.port,
       });
 
       this.logger.info(`API server listening on ${this.config.host}:${this.config.port}`);
