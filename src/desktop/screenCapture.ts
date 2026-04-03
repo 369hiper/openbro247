@@ -11,6 +11,8 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
+import screenshot from 'screenshot-desktop';
+import { Jimp } from 'jimp';
 import { Logger } from '../utils/logger';
 
 const execAsync = promisify(exec);
@@ -70,91 +72,31 @@ export class ScreenCapture {
     }
   }
 
-  /**
-   * Get list of monitors
-   */
   async getMonitors(): Promise<MonitorInfo[]> {
-    const script = `
-      Add-Type -AssemblyName System.Windows.Forms
-      $screens = [System.Windows.Forms.Screen]::AllScreens
-      $result = @()
-      
-      for ($i = 0; $i -lt $screens.Count; $i++) {
-        $screen = $screens[$i]
-        $result += @{
-          index = $i
-          x = $screen.Bounds.X
-          y = $screen.Bounds.Y
-          width = $screen.Bounds.Width
-          height = $screen.Bounds.Height
-          isPrimary = $screen.Primary
-          deviceName = $screen.DeviceName
-        }
-      }
-      
-      $result | ConvertTo-Json
-    `;
-
-    const { stdout } = await execAsync(`powershell -Command "${script}"`);
-    return JSON.parse(stdout);
+    try {
+      const displays = await screenshot.listDisplays();
+      return displays.map((d: any, index: number) => ({
+        index,
+        x: 0,
+        y: 0,
+        width: typeof d.width === 'number' ? d.width : 1920,
+        height: typeof d.height === 'number' ? d.height : 1080,
+        isPrimary: index === 0, // Assumption as screenshot-desktop doesn't expose it
+        deviceName: d.name || `Display ${index}`
+      }));
+    } catch(err) {
+      logger.error('Failed to get monitors', err);
+      return [];
+    }
   }
 
-  /**
-   * Capture entire screen
-   */
   async capture(options?: CaptureOptions): Promise<Buffer> {
-    const format = options?.format || 'png';
-    const quality = options?.quality || 90;
-
-    const script = `
-      Add-Type -AssemblyName System.Windows.Forms
-      Add-Type -AssemblyName System.Drawing
-      
-      # Get screen bounds
-      $screen = [System.Windows.Forms.Screen]::PrimaryScreen
-      ${options?.monitor !== undefined ? `$screen = [System.Windows.Forms.Screen]::AllScreens[${options.monitor}]` : ''}
-      
-      $bounds = $screen.Bounds
-      
-      # Apply crop if specified
-      ${options?.x !== undefined ? `$bounds = New-Object System.Drawing.Rectangle(${options.x}, ${options.y}, ${options.width}, ${options.height})` : ''}
-      
-      # Create bitmap
-      $width = ${options?.width || '$bounds.Width'}
-      $height = ${options?.height || '$bounds.Height'}
-      $bitmap = New-Object System.Drawing.Bitmap $width, $height
-      $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-      
-      # Copy screen
-      $graphics.CopyFromScreen(
-        $bounds.X, 
-        $bounds.Y, 
-        0, 
-        0, 
-        $bitmap.Size, 
-        [System.Drawing.CopyPixelOperation]::SourceCopy
-      )
-      
-      # Save to memory stream
-      $ms = New-Object System.IO.MemoryStream
-      $format = [System.Drawing.Imaging.ImageFormat]::${format === 'jpeg' ? 'Jpeg' : format === 'bmp' ? 'Bmp' : 'Png'}
-      
-      ${format === 'jpeg' ? `
-        $encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
-        $encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, ${quality}L)
-        $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
-        $bitmap.Save($ms, $codec, $encoderParams)
-      ` : '$bitmap.Save($ms, $format)'}
-      
-      $bytes = $ms.ToArray()
-      [Convert]::ToBase64String($bytes)
-    `;
-
+    let format: 'png' | 'jpg' = 'png';
+    if (options?.format === 'jpeg') format = 'jpg';
+    
     try {
-      const { stdout } = await execAsync(`powershell -Command "${script.replace(/"/g, '`"')}"`, {
-        maxBuffer: 50 * 1024 * 1024 // 50MB for large screenshots
-      });
-      return Buffer.from(stdout.trim(), 'base64');
+      const imgBuffer = await screenshot({ format });
+      return imgBuffer;
     } catch (error) {
       logger.error('Failed to capture screen', error);
       throw error;
@@ -175,9 +117,6 @@ export class ScreenCapture {
         
         [DllImport("user32.dll")]
         public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-        
-        [DllImport("user32.dll")]
-        public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
       }
       
       [StructLayout(LayoutKind.Sequential)]
@@ -198,24 +137,28 @@ export class ScreenCapture {
       $width = $rect.Right - $rect.Left
       $height = $rect.Bottom - $rect.Top
       
-      Add-Type -AssemblyName System.Drawing
-      $bitmap = New-Object System.Drawing.Bitmap $width, $height
-      $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-      
-      $hdc = $graphics.GetHdc()
-      [Win32]::PrintWindow($hwnd, $hdc, 0)
-      $graphics.ReleaseHdc($hdc)
-      
-      $ms = New-Object System.IO.MemoryStream
-      $bitmap.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-      $bytes = $ms.ToArray()
-      
-      [Convert]::ToBase64String($bytes)
+      # Output coordinates
+      $rect.Left.ToString() + "," + $rect.Top.ToString() + "," + $width.ToString() + "," + $height.ToString()
     `;
 
     try {
       const { stdout } = await execAsync(`powershell -Command "${script.replace(/"/g, '`"')}"`);
-      return Buffer.from(stdout.trim(), 'base64');
+      const coords = stdout.trim().split(',');
+      if (coords.length !== 4) throw new Error('Failed to get window coordinates');
+      
+      const x = parseInt(coords[0], 10);
+      const y = parseInt(coords[1], 10);
+      const width = parseInt(coords[2], 10);
+      const height = parseInt(coords[3], 10);
+
+      // Capture full screen
+      const fullScreenBuffer = await this.capture({ format: 'png' });
+      
+      // Crop with Jimp
+      const image = await Jimp.read(fullScreenBuffer);
+      image.crop({ x, y, w: width, h: height });
+      
+      return await image.getBuffer('image/png');
     } catch (error) {
       logger.error(`Failed to capture window "${windowTitle}"`, error);
       throw error;

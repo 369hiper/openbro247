@@ -50,17 +50,56 @@ export class ResearchReportGenerator {
 
     this.logger.info(`Generating research report: ${topic}`);
 
-    // Step 1: Search for information
-    const searchResults = await this.searchForTopic(topic, maxSources);
+    let currentTopic = topic;
+    let allCrawledContent: string[] = [];
+    let report: ResearchReport | null = null;
+    const maxIterations = 3;
 
-    // Step 2: Crawl relevant pages
-    const crawledContent = await this.crawlRelevantPages(searchResults, depth);
+    for (let i = 0; i < maxIterations; i++) {
+      this.logger.info(`Research iteration ${i + 1}/${maxIterations} for: ${currentTopic}`);
 
-    // Step 3: Generate report using AI
-    const report = await this.generateReportWithAI(topic, crawledContent, format);
+      // Step 1: Search for information
+      const searchResults = await this.searchForTopic(currentTopic, maxSources);
 
-    // Step 4: Store in memory
-    await this.storeReportInMemory(report);
+      // Step 2: Crawl relevant pages
+      const newContent = await this.crawlRelevantPages(searchResults, depth);
+      
+      // De-duplicate contents to avoid huge context window
+      const uniqueContents = newContent.filter(c => !allCrawledContent.includes(c));
+      allCrawledContent = allCrawledContent.concat(uniqueContents);
+
+      // Step 3: Generate report using AI
+      report = await this.generateReportWithAI(topic, allCrawledContent, format);
+
+      // Step 4: Evaluate the report
+      const evaluationPrompt = `Review the following research report summary on the topic "${topic}".
+Does it comprehensively cover the topic, or are there significant missing gaps that require further research?
+If it is comprehensive, respond with exactly "COMPLETE".
+If there are gaps, respond ONLY with a short, specific search query to find the missing information. Do not include quotes or explanations.
+
+Report Summary:
+${report.summary}`;
+
+      const evalResponse = await this.llmManager.generate(evaluationPrompt, { maxTokens: 100, temperature: 0.1 });
+      const nextAction = evalResponse.content.trim();
+
+      if (nextAction.toUpperCase() === 'COMPLETE' || i === maxIterations - 1) {
+        this.logger.info(`Research complete or max iterations reached.`);
+        break;
+      } else {
+        this.logger.info(`Gaps identified. Next search query: ${nextAction}`);
+        currentTopic = nextAction;
+      }
+    }
+
+    // Step 5: Store in memory
+    if (report) {
+      await this.storeReportInMemory(report);
+    }
+
+    if (!report) {
+      throw new Error(`Failed to generate research report for: ${topic}`);
+    }
 
     this.logger.info(`Research report generated: ${topic}`);
     return report;

@@ -1,8 +1,11 @@
 import 'dotenv/config';
+import { fileURLToPath } from 'url';
 import { APIServer } from './api/server';
 import { LLMManager } from './ai/llmManager';
 import { SemanticMemory } from './memory/semanticMemory';
 import { BrowserEngine } from './browser/engine';
+import { getClaudeCodeController } from './desktop/claudeCodeController';
+import { getScreenCapture } from './desktop/screenCapture';
 import { AgentManager } from './agents/agentManager';
 import { ModelRouter } from './models/modelRouter';
 import { TaskOrchestrator } from './tasks/taskOrchestrator';
@@ -18,6 +21,8 @@ import { HeartbeatSystem } from './agents/heartbeat';
 import { CronScheduler } from './tasks/cronScheduler';
 import { UsageTracker } from './utils/usageTracker';
 import { initMarketingPlugin } from './plugins/marketing';
+import { LangGraphOrchestrator } from './agents';
+import { ModelFallbackManager } from './ai/modelFallbackManager';
 
 interface AppConfig {
   server: {
@@ -52,7 +57,7 @@ function validateConfig(config: AppConfig): void {
   if (!config.memory.vectorPath) throw new Error('VECTOR_PATH is required');
   if (!config.memory.sqlitePath) throw new Error('SQLITE_PATH is required');
 
-  const validProviders = ['openai', 'anthropic', 'local'];
+  const validProviders = ['openai', 'anthropic', 'local', 'openrouter'];
   if (!validProviders.includes(config.llm.defaultProvider)) {
     throw new Error(`DEFAULT_LLM_PROVIDER must be one of: ${validProviders.join(', ')}`);
   }
@@ -100,6 +105,11 @@ function loadConfig(): AppConfig {
         local: {
           baseUrl: process.env.LOCAL_LLM_BASE_URL || 'http://localhost:11434',
           model: process.env.LOCAL_LLM_MODEL || 'llama2'
+        },
+        openrouter: {
+          apiKey: process.env.OPENROUTER_API_KEY,
+          baseUrl: 'https://openrouter.ai/api/v1',
+          model: process.env.OPENROUTER_DEFAULT_MODEL || 'minimax/minimax-m2.5:free'
         }
       }
     },
@@ -188,6 +198,17 @@ async function main() {
       throw new Error(`Failed to initialize agent manager: ${error instanceof Error ? error.message : String(error)}`);
     }
 
+    // Initialize model fallback manager (seeds free models into DB)
+    let modelFallbackManager: ModelFallbackManager | undefined;
+    try {
+      modelFallbackManager = new ModelFallbackManager(sqliteStore);
+      await modelFallbackManager.initialize();
+      const allModels = await modelFallbackManager.getAllModels();
+      logger.info(`Model fallback manager initialized with ${allModels.length} models`);
+    } catch (error) {
+      logger.warn(`Model fallback manager failed to init: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
     try {
       modelRouter = new ModelRouter();
       logger.info('Model router initialized');
@@ -196,7 +217,7 @@ async function main() {
     }
 
     try {
-      taskOrchestrator = new TaskOrchestrator(sqliteStore);
+      taskOrchestrator = new TaskOrchestrator({ sqliteStore });
       logger.info('Task orchestrator initialized');
     } catch (error) {
       throw new Error(`Failed to initialize task orchestrator: ${error instanceof Error ? error.message : String(error)}`);
@@ -211,7 +232,7 @@ async function main() {
     }
 
     try {
-      computerOrchestrator = new ComputerUseOrchestrator(browserEngine, modelRouter);
+      computerOrchestrator = new ComputerUseOrchestrator(browserEngine, modelRouter, getClaudeCodeController());
       await computerOrchestrator.initialize();
       logger.info('Computer use orchestrator initialized');
     } catch (error) {
@@ -338,6 +359,12 @@ async function main() {
         }
 
         logger.info('Shutdown completed successfully');
+
+        // Stop Phase 1 systems
+        try {
+          if (typeof heartbeatSystem !== 'undefined' && heartbeatSystem) heartbeatSystem.stop();
+        } catch (_) { /* ignore */ }
+
         process.exit(0);
       } catch (error) {
         logger.error('Error during shutdown', error);
@@ -370,7 +397,9 @@ async function main() {
 }
 
 // Run the application
-if (require.main === module) {
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === (process.argv[1].endsWith('.ts') || process.argv[1].endsWith('.js') ? process.argv[1] : (process.argv[1] + '.ts'));
+
+if (isMain) {
   main().catch((error) => {
     console.error('Unhandled error:', error);
     process.exit(1);

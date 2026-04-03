@@ -63,6 +63,18 @@ export class LLMManager {
             });
             break;
 
+          case 'openrouter':
+            // OpenRouter – OpenAI-compatible API at openrouter.ai
+            client = new OpenAI({
+              apiKey: config.apiKey,
+              baseURL: config.baseUrl || 'https://openrouter.ai/api/v1',
+              defaultHeaders: {
+                'HTTP-Referer': 'https://github.com/openbro247',
+                'X-Title': 'OpenBro247',
+              },
+            });
+            break;
+
           default:
             this.logger.warn(`Unknown provider: ${name}`);
             continue;

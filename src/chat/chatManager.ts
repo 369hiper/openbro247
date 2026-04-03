@@ -1,82 +1,24 @@
 import { v4 as uuidv4 } from 'uuid';
 import { Logger } from '../utils/logger';
+import { LRUCache } from '../utils/cache';
 import { SQLiteStore } from '../memory/sqliteStore';
 import { ModelRouter } from '../models/modelRouter';
 import { AgentManager } from '../agents/agentManager';
 import { ChatMessage, ChatSession, ChatSessionConfig } from './types';
+import { ChatRole } from '../models/types';
 
 // Custom error types
-class ChatSessionNotFoundError extends Error {
+export class ChatSessionNotFoundError extends Error {
   constructor(sessionId: string) {
     super(`Chat session not found: ${sessionId}`);
     this.name = 'ChatSessionNotFoundError';
   }
 }
 
-class InvalidSessionConfigError extends Error {
+export class InvalidSessionConfigError extends Error {
   constructor(message: string) {
     super(`Invalid session configuration: ${message}`);
     this.name = 'InvalidSessionConfigError';
-  }
-}
-
-// LRU Cache
-class LRUCache<T extends { id: string }> {
-  private cache: Map<string, T> = new Map();
-  private accessOrder: string[] = [];
-  private readonly maxSize: number;
-
-  constructor(maxSize: number = 500) {
-    this.maxSize = maxSize;
-  }
-
-  set(key: string, value: T): void {
-    const index = this.accessOrder.indexOf(key);
-    if (index > -1) {
-      this.accessOrder.splice(index, 1);
-    }
-    this.accessOrder.push(key);
-    this.cache.set(key, value);
-
-    if (this.cache.size > this.maxSize) {
-      const lruKey = this.accessOrder.shift();
-      if (lruKey) {
-        this.cache.delete(lruKey);
-      }
-    }
-  }
-
-  get(key: string): T | undefined {
-    const value = this.cache.get(key);
-    if (value) {
-      const index = this.accessOrder.indexOf(key);
-      if (index > -1) {
-        this.accessOrder.splice(index, 1);
-      }
-      this.accessOrder.push(key);
-    }
-    return value;
-  }
-
-  has(key: string): boolean {
-    return this.cache.has(key);
-  }
-
-  delete(key: string): boolean {
-    const index = this.accessOrder.indexOf(key);
-    if (index > -1) {
-      this.accessOrder.splice(index, 1);
-    }
-    return this.cache.delete(key);
-  }
-
-  clear(): void {
-    this.cache.clear();
-    this.accessOrder = [];
-  }
-
-  size(): number {
-    return this.cache.size;
   }
 }
 
@@ -99,7 +41,7 @@ export class ChatManager {
     this.modelRouter = modelRouter;
     this.agentManager = agentManager;
     this.logger = new Logger('ChatManager');
-    this.sessionCache = new LRUCache(this.maxCacheSize);
+    this.sessionCache = new LRUCache<ChatSession>(this.maxCacheSize);
   }
 
   async initialize(): Promise<void> {
@@ -167,14 +109,14 @@ export class ChatManager {
         throw new ChatSessionNotFoundError(sessionId);
       }
 
-      const userMessage: ChatMessage = {
-        id: uuidv4(),
-        sessionId,
-        role: 'user',
-        content,
-        timestamp: new Date(),
-        metadata
-      };
+       const userMessage: ChatMessage = {
+         id: uuidv4(),
+         sessionId,
+         role: ChatRole.USER,
+         content,
+         timestamp: new Date(),
+         metadata
+       };
 
       session.messages.push(userMessage);
       await this.sqliteStore.storeChatMessage(userMessage);
@@ -197,7 +139,7 @@ export class ChatManager {
       const assistantMessage: ChatMessage = {
         id: uuidv4(),
         sessionId,
-        role: 'assistant',
+        role: ChatRole.ASSISTANT,
         content: response,
         timestamp: new Date()
       };
@@ -232,7 +174,7 @@ export class ChatManager {
       const userMessage: ChatMessage = {
         id: uuidv4(),
         sessionId,
-        role: 'user',
+        role: ChatRole.USER,
         content,
         timestamp: new Date()
       };
@@ -258,7 +200,7 @@ export class ChatManager {
       const assistantMessage: ChatMessage = {
         id: uuidv4(),
         sessionId,
-        role: 'assistant',
+        role: ChatRole.ASSISTANT,
         content: response,
         timestamp: new Date()
       };
@@ -379,7 +321,7 @@ export class ChatManager {
     return this.concurrentOps;
   }
 
-  private buildSystemMessage(agent: any): string {
+  private buildSystemMessage(agent: { name: string; capabilities: string[] }): string {
     return `You are ${agent.name}, an AI agent with the following capabilities: ${agent.capabilities.join(', ')}.
 You are part of a multi-agent system and can help with various tasks.
 Be helpful, concise, and accurate in your responses.`;

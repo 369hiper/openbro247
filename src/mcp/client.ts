@@ -24,15 +24,23 @@ interface MCPResponse {
 }
 
 interface MCPServerConfig {
-  name: string;
-  command: string;
+  name?: string;
+  command?: string;
   args?: string[];
   env?: Record<string, string>;
 }
 
+interface HTTPServerConfig {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+}
+
+type MCPConfig = MCPServerConfig | HTTPServerConfig;
+
 export class MCPClient {
   private logger: Logger;
-  private servers: Map<string, MCPServerConfig> = new Map();
+  private servers: Map<string, MCPConfig> = new Map();
   private connections: Map<string, any> = new Map();
   private availableTools: Map<string, MCPTool[]> = new Map();
 
@@ -40,7 +48,7 @@ export class MCPClient {
     this.logger = new Logger("MCP-Client");
   }
 
-  async registerServer(name: string, config: MCPServerConfig): Promise<void> {
+  async registerServer(name: string, config: MCPConfig): Promise<void> {
     this.logger.info(`Registering MCP server: ${name}`);
     this.servers.set(name, config);
   }
@@ -54,15 +62,28 @@ export class MCPClient {
     this.logger.info(`Connecting to MCP server: ${name}`);
 
     try {
-      // For now, we'll use a mock connection
-      // In a real implementation, this would spawn the server process
-      // and communicate via stdio
-      const connection = {
-        name,
-        config,
-        connected: true,
-        tools: [] as MCPTool[]
-      };
+      let connection: any;
+      
+      // Check if it's an HTTP-based server
+      if ('type' in config && config.type === 'http') {
+        // HTTP-based MCP server connection
+        connection = {
+          name,
+          config,
+          connected: true,
+          type: 'http',
+          tools: [] as MCPTool[]
+        };
+      } else {
+        // Stdio-based MCP server connection (existing behavior)
+        connection = {
+          name,
+          config,
+          connected: true,
+          type: 'stdio',
+          tools: [] as MCPTool[]
+        };
+      }
 
       this.connections.set(name, connection);
 
@@ -118,8 +139,34 @@ export class MCPClient {
 
     this.logger.info(`Calling tool ${toolName} on server ${serverName}`, args);
 
-    // Mock tool execution - in real implementation, this would send
-    // a tools/call request to the server
+    // Handle HTTP-based MCP servers
+    if (connection.type === 'http') {
+      const httpConfig = connection.config;
+      try {
+        const response = await fetch(`${httpConfig.url}/tools/call`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...httpConfig.headers
+          },
+          body: JSON.stringify({
+            method: 'tools/call',
+            params: {
+              name: toolName,
+              arguments: args
+            }
+          })
+        });
+        
+        const result = await response.json();
+        return result;
+      } catch (error) {
+        this.logger.error(`HTTP MCP tool call failed: ${toolName}`, error);
+        throw error;
+      }
+    }
+
+    // Mock tool execution for stdio-based servers
     const response: MCPResponse = {
       result: {
         content: [
@@ -164,5 +211,57 @@ export class MCPClient {
     this.logger.info("Disconnecting from all MCP servers");
     this.connections.clear();
     this.availableTools.clear();
+  }
+
+  // Pre-configured server registrations
+  async registerBlotatoServer(apiKey: string): Promise<void> {
+    await this.registerServer('blotato', {
+      type: 'http',
+      url: 'https://mcp.blotato.com/mcp',
+      headers: {
+        'blotato-api-key': apiKey
+      }
+    });
+    this.logger.info('Blotato MCP server registered');
+  }
+
+  async registerTavilyServer(): Promise<void> {
+    await this.registerServer('tavily', {
+      command: 'npx',
+      args: ['-y', 'tavily-mcp@0.2.3']
+    });
+    this.logger.info('Tavily MCP server registered');
+  }
+
+  async registerContext7Server(): Promise<void> {
+    await this.registerServer('context7', {
+      command: 'npx',
+      args: ['-y', '@upstash/context7-mcp']
+    });
+    this.logger.info('Context7 MCP server registered');
+  }
+
+  async registerMemoryServer(): Promise<void> {
+    await this.registerServer('memory', {
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-memory']
+    });
+    this.logger.info('Memory MCP server registered');
+  }
+
+  async registerFetchServer(): Promise<void> {
+    await this.registerServer('fetch', {
+      command: 'python',
+      args: ['-m', 'mcp_server_fetch']
+    });
+    this.logger.info('Fetch MCP server registered');
+  }
+
+  async registerAllDefaultServers(): Promise<void> {
+    await this.registerTavilyServer();
+    await this.registerContext7Server();
+    await this.registerMemoryServer();
+    await this.registerFetchServer();
+    this.logger.info('All default MCP servers registered');
   }
 }

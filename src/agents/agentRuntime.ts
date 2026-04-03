@@ -5,6 +5,7 @@ import { BrowserEngine } from '../browser/engine';
 import { SQLiteStore } from '../memory/sqliteStore';
 import { Agent } from './types';
 import { ToolRegistry, ToolResult, ToolDefinition } from '../skills/toolRegistry';
+import { EventEmitter } from 'events';
 
 // ──────────────────────────────────────────────
 // Types
@@ -67,6 +68,7 @@ export class AgentRuntime {
   private sqliteStore: SQLiteStore;
   private toolRegistry: ToolRegistry;
   private activeExecutions: Map<string, AgentExecution> = new Map();
+  public events: EventEmitter = new EventEmitter();
 
   constructor(
     llm: LLMManager,
@@ -200,6 +202,8 @@ export class AgentRuntime {
 
     conversationHistory.push({ role: 'user', content: initialPrompt });
 
+    this.events.emit('execution:start', { executionId: execution.id, goal: execution.goal });
+
     for (let i = 0; i < opts.maxIterations; i++) {
       execution.iterations = i + 1;
 
@@ -227,6 +231,7 @@ export class AgentRuntime {
         const answerMatch = responseText.match(/FINAL ANSWER:\s*([\s\S]+)/);
         const finalAnswer = answerMatch ? answerMatch[1].trim() : responseText;
         conversationHistory.push({ role: 'assistant', content: responseText });
+        this.events.emit('execution:complete', { executionId: execution.id, finalAnswer });
         return finalAnswer;
       }
 
@@ -252,6 +257,9 @@ export class AgentRuntime {
         status: 'running',
         startedAt: new Date(),
       };
+      
+      this.events.emit('step:thought', { executionId: execution.id, stepId: step.id, thought: step.thought });
+      this.events.emit('step:action', { executionId: execution.id, stepId: step.id, tool: step.tool, input: step.toolInput });
       execution.plan.steps.push(step);
 
       // Execute the tool
@@ -265,6 +273,8 @@ export class AgentRuntime {
         : `Error: ${toolResult.error}`;
       step.completedAt = new Date();
       step.durationMs = step.completedAt.getTime() - step.startedAt!.getTime();
+
+      this.events.emit('step:observation', { executionId: execution.id, stepId: step.id, observation: step.observation, success: toolResult.success });
 
       // Add the assistant's action and tool observation to history
       conversationHistory.push({ role: 'assistant', content: responseText });

@@ -12,6 +12,7 @@
 
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { keyboard, mouse, Key, Point, Button } from '@nut-tree-fork/nut-js';
 import { Logger } from '../utils/logger';
 
 const execAsync = promisify(exec);
@@ -361,40 +362,22 @@ export class WindowsControl {
    * Move mouse to position
    */
   async mouseMove(x: number, y: number): Promise<void> {
-    const script = `
-      Add-Type -AssemblyName System.Windows.Forms
-      [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(${x}, ${y})
-    `;
-    
-    await execAsync(`powershell -Command "${script}"`);
+    await mouse.setPosition(new Point(x, y));
   }
 
   /**
    * Click mouse at position
    */
-  async mouseClick(x: number, y: number, button: 'left' | 'right' | 'middle' = 'left'): Promise<void> {
+  async mouseClick(x: number, y: number, btn: 'left' | 'right' | 'middle' = 'left'): Promise<void> {
     await this.mouseMove(x, y);
     
-    const mouseEvent = {
-      left: 0x02,
-      right: 0x08,
-      middle: 0x20
-    };
-    
-    const script = `
-      Add-Type @"
-      using System;
-      using System.Runtime.InteropServices;
-      public class Win32 {
-        [DllImport("user32.dll")]
-        public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
-      }
-"@
-      
-      [Win32]::mouse_event(${mouseEvent[button]}, 0, 0, 0, [UIntPtr]::Zero)
-    `;
-    
-    await execAsync(`powershell -Command "${script}"`);
+    if (btn === 'right') {
+      await mouse.click(Button.RIGHT);
+    } else if (btn === 'middle') {
+      await mouse.click(Button.MIDDLE);
+    } else {
+      await mouse.click(Button.LEFT);
+    }
   }
 
   /**
@@ -425,14 +408,9 @@ export class WindowsControl {
       await this.clickElement(options.element);
     }
     
-    const delay = options?.delay || 50;
-    
-    for (const char of text) {
-      await this.sendKeys(char);
-      if (delay > 0) {
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
+    // Fallback to powershell for complex types or use nut-js
+    keyboard.config.autoDelayMs = options?.delay || 50;
+    await keyboard.type(text);
     
     logger.debug(`Typed text: ${text}`);
   }

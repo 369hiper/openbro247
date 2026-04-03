@@ -64,7 +64,7 @@ export interface ScreenAnalysis {
 /**
  * Vision Model Provider
  */
-export type VisionProvider = 'openai' | 'anthropic' | 'local';
+export type VisionProvider = 'openai' | 'anthropic' | 'local' | 'openrouter';
 
 /**
  * Vision Engine Configuration
@@ -166,9 +166,12 @@ For each element, provide:
 Return as JSON array.`
       });
 
-      // Parse the response to extract elements
-      // This is simplified - would need proper JSON parsing from vision model
-      return [];
+      const contentStr = typeof analysis === 'string' ? analysis : JSON.stringify(analysis);
+      const match = contentStr.match(/\[[\s\S]*\]/);
+      if (match) {
+        return JSON.parse(match[0]);
+      }
+      return Array.isArray(analysis) ? analysis : (analysis.elements || []);
     } catch (error) {
       logger.error('Element detection failed', error);
       return [];
@@ -213,20 +216,21 @@ Return as structured JSON.`
    * Analyze with vision model (GPT-4V, Claude Vision, etc.)
    */
   private async analyzeWithVisionModel(
-    imageBuffer: Buffer,
+    imageBuffer: Buffer | Buffer[],
     options: { prompt: string; maxTokens?: number }
   ): Promise<any> {
-    const base64Image = imageBuffer.toString('base64');
+    const buffers = Array.isArray(imageBuffer) ? imageBuffer : [imageBuffer];
 
     switch (this.config.provider) {
       case 'openai':
-        return this.analyzeWithOpenAI(base64Image, options);
+      case 'openrouter':
+        return this.analyzeWithOpenAI(buffers, options);
       
       case 'anthropic':
-        return this.analyzeWithAnthropic(base64Image, options);
+        return this.analyzeWithAnthropic(buffers, options);
       
       case 'local':
-        return this.analyzeWithLocal(base64Image, options);
+        return this.analyzeWithLocal(buffers, options);
       
       default:
         throw new Error(`Unknown vision provider: ${this.config.provider}`);
@@ -234,31 +238,57 @@ Return as structured JSON.`
   }
 
   /**
-   * Analyze with OpenAI GPT-4 Vision
+   * Analyze with OpenAI GPT-4 Vision or OpenRouter
    */
   private async analyzeWithOpenAI(
-    base64Image: string,
+    buffers: Buffer[],
     options: { prompt: string; maxTokens?: number }
   ): Promise<any> {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    let baseUrl = this.config.baseUrl;
+    
+    // Default URLs if not provided
+    if (!baseUrl) {
+      if (this.config.provider === 'openrouter') {
+        baseUrl = 'https://openrouter.ai/api/v1';
+      } else {
+        baseUrl = 'https://api.openai.com/v1';
+      }
+    }
+    
+    // Remove trailing slash and ensure /chat/completions is appended correctly
+    baseUrl = baseUrl.replace(/\/$/, '');
+    // If the user provided a full path ending in /chat/completions, allow it, otherwise append
+    const url = baseUrl.endsWith('/chat/completions') 
+      ? baseUrl 
+      : `${baseUrl}/chat/completions`;
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${this.config.apiKey}`
+    };
+
+    // Add OpenRouter specific headers if needed
+    if (this.config.provider === 'openrouter') {
+      headers['HTTP-Referer'] = 'https://github.com/openbro247'; // Optional
+      headers['X-Title'] = 'OpenBro247'; // Optional
+    }
+
+    const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.config.apiKey}`
-      },
+      headers,
       body: JSON.stringify({
-        model: this.config.model || 'gpt-4o',
+        model: this.config.model || (this.config.provider === 'openrouter' ? 'google/gemini-2.0-pro-exp-02-05:free' : 'gpt-4o'),
         messages: [
           {
             role: 'user',
             content: [
               { type: 'text', text: options.prompt },
-              {
+              ...buffers.map(buf => ({
                 type: 'image_url',
                 image_url: {
-                  url: `data:image/png;base64,${base64Image}`
+                  url: `data:image/png;base64,${buf.toString('base64')}`
                 }
-              }
+              }))
             ]
           }
         ],
@@ -268,7 +298,7 @@ Return as structured JSON.`
 
     if (!response.ok) {
       const error = await response.text();
-      throw new Error(`OpenAI API error: ${error}`);
+      throw new Error(`${this.config.provider === 'openrouter' ? 'OpenRouter' : 'OpenAI'} API error: ${error}`);
     }
 
     const data: any = await response.json();
@@ -286,7 +316,7 @@ Return as structured JSON.`
    * Analyze with Anthropic Claude Vision
    */
   private async analyzeWithAnthropic(
-    base64Image: string,
+    buffers: Buffer[],
     options: { prompt: string; maxTokens?: number }
   ): Promise<any> {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -303,14 +333,14 @@ Return as structured JSON.`
           {
             role: 'user',
             content: [
-              {
+              ...buffers.map(buf => ({
                 type: 'image',
                 source: {
                   type: 'base64',
                   media_type: 'image/png',
-                  data: base64Image
+                  data: buf.toString('base64')
                 }
-              },
+              })),
               {
                 type: 'text',
                 text: options.prompt
@@ -341,7 +371,7 @@ Return as structured JSON.`
    * Analyze with local model (via Ollama or similar)
    */
   private async analyzeWithLocal(
-    base64Image: string,
+    buffers: Buffer[],
     options: { prompt: string; maxTokens?: number }
   ): Promise<any> {
     const baseUrl = this.config.baseUrl || 'http://localhost:11434';
@@ -354,7 +384,7 @@ Return as structured JSON.`
       body: JSON.stringify({
         model: this.config.model || 'llava',
         prompt: options.prompt,
-        images: [base64Image],
+        images: buffers.map(b => b.toString('base64')),
         stream: false
       })
     });
@@ -417,10 +447,7 @@ Return as structured JSON.`
     image1: Buffer,
     image2: Buffer
   ): Promise<{ similar: boolean; difference: number; changes: string[] }> {
-    const base64Image1 = image1.toString('base64');
-    const base64Image2 = image2.toString('base64');
-
-    const analysis = await this.analyzeWithVisionModel(image1, {
+    const analysis = await this.analyzeWithVisionModel([image1, image2], {
       prompt: `Compare these two screenshots and identify the differences.
 Image 1 is the first screenshot, Image 2 is the second.
 Describe what changed between them.

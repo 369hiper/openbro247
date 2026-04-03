@@ -1,96 +1,28 @@
 import { v4 as uuidv4 } from 'uuid';
 import { Logger } from '../utils/logger';
+import { LRUCache } from '../utils/cache';
 import { SQLiteStore } from '../memory/sqliteStore';
 import { Agent, AgentConfig, AgentFilters, ModelConfig } from './types';
 
 // Custom error types for better error handling
-class AgentNotFoundError extends Error {
+export class AgentNotFoundError extends Error {
   constructor(agentId: string) {
     super(`Agent not found: ${agentId}`);
     this.name = 'AgentNotFoundError';
   }
 }
 
-class NotInitializedError extends Error {
+export class NotInitializedError extends Error {
   constructor() {
     super('AgentManager not initialized. Call initialize() first.');
     this.name = 'NotInitializedError';
   }
 }
 
-class InvalidAgentConfigError extends Error {
+export class InvalidAgentConfigError extends Error {
   constructor(message: string) {
     super(`Invalid agent configuration: ${message}`);
     this.name = 'InvalidAgentConfigError';
-  }
-}
-
-// Implement LRU cache with eviction
-class LRUCache<T extends { id: string }> {
-  private cache: Map<string, T> = new Map();
-  private accessOrder: string[] = [];
-  private readonly maxSize: number;
-
-  constructor(maxSize: number = 500) {
-    this.maxSize = maxSize;
-  }
-
-  set(key: string, value: T): void {
-    // Remove from order if exists
-    const index = this.accessOrder.indexOf(key);
-    if (index > -1) {
-      this.accessOrder.splice(index, 1);
-    }
-
-    // Add to end (most recently used)
-    this.accessOrder.push(key);
-    this.cache.set(key, value);
-
-    // Evict if over capacity
-    if (this.cache.size > this.maxSize) {
-      const lruKey = this.accessOrder.shift();
-      if (lruKey) {
-        this.cache.delete(lruKey);
-      }
-    }
-  }
-
-  get(key: string): T | undefined {
-    const value = this.cache.get(key);
-    if (value) {
-      // Move to end (mark as recently used)
-      const index = this.accessOrder.indexOf(key);
-      if (index > -1) {
-        this.accessOrder.splice(index, 1);
-      }
-      this.accessOrder.push(key);
-    }
-    return value;
-  }
-
-  has(key: string): boolean {
-    return this.cache.has(key);
-  }
-
-  delete(key: string): boolean {
-    const index = this.accessOrder.indexOf(key);
-    if (index > -1) {
-      this.accessOrder.splice(index, 1);
-    }
-    return this.cache.delete(key);
-  }
-
-  clear(): void {
-    this.cache.clear();
-    this.accessOrder = [];
-  }
-
-  size(): number {
-    return this.cache.size;
-  }
-
-  entries(): IterableIterator<[string, T]> {
-    return this.cache.entries();
   }
 }
 
@@ -105,7 +37,7 @@ export class AgentManager {
   constructor(sqliteStore: SQLiteStore) {
     this.sqliteStore = sqliteStore;
     this.logger = new Logger('AgentManager');
-    this.agentCache = new LRUCache(this.maxCacheSize);
+    this.agentCache = new LRUCache<Agent>(this.maxCacheSize);
   }
 
   async initialize(): Promise<void> {

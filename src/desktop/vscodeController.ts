@@ -17,6 +17,7 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import { Logger } from '../utils/logger';
 import { WindowsControl, getWindowsControl } from './windowsControl';
+import { IDEController } from '../computer-use/types';
 
 const execAsync = promisify(exec);
 
@@ -45,7 +46,7 @@ export interface FileEdit {
 /**
  * VS Code Controller
  */
-export class VSCodeController {
+export class VSCodeController implements IDEController {
   private windowsControl: WindowsControl;
   private vscodePath: string = 'code';
   private isInitialized = false;
@@ -259,7 +260,11 @@ export class VSCodeController {
    */
   async createFile(filePath: string, content?: string): Promise<void> {
     await this.writeFile(filePath, content || '');
-    await this.openFile(filePath);
+    try {
+      await this.openFile(filePath);
+    } catch (e) {
+      logger.warn(`Could not open file in VS Code: ${filePath}`);
+    }
     logger.info(`Created file: ${filePath}`);
   }
 

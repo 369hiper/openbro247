@@ -1,80 +1,27 @@
 import { v4 as uuidv4 } from 'uuid';
 import { Logger } from '../utils/logger';
+import { LRUCache } from '../utils/cache';
 import { SQLiteStore } from '../memory/sqliteStore';
 import { Task, TaskConfig, TaskFilters } from './types';
+import { TaskStatus, TaskPriority } from '../models/types';
+
+export interface TaskOrchestratorDependencies {
+  sqliteStore: SQLiteStore;
+  logger?: Logger;
+}
 
 // Custom error types
-class TaskNotFoundError extends Error {
+export class TaskNotFoundError extends Error {
   constructor(taskId: string) {
     super(`Task not found: ${taskId}`);
     this.name = 'TaskNotFoundError';
   }
 }
 
-class InvalidTaskConfigError extends Error {
+export class InvalidTaskConfigError extends Error {
   constructor(message: string) {
     super(`Invalid task configuration: ${message}`);
     this.name = 'InvalidTaskConfigError';
-  }
-}
-
-// LRU Cache implementation
-class LRUCache<T extends { id: string }> {
-  private cache: Map<string, T> = new Map();
-  private accessOrder: string[] = [];
-  private readonly maxSize: number;
-
-  constructor(maxSize: number = 1000) {
-    this.maxSize = maxSize;
-  }
-
-  set(key: string, value: T): void {
-    const index = this.accessOrder.indexOf(key);
-    if (index > -1) {
-      this.accessOrder.splice(index, 1);
-    }
-    this.accessOrder.push(key);
-    this.cache.set(key, value);
-
-    if (this.cache.size > this.maxSize) {
-      const lruKey = this.accessOrder.shift();
-      if (lruKey) {
-        this.cache.delete(lruKey);
-      }
-    }
-  }
-
-  get(key: string): T | undefined {
-    const value = this.cache.get(key);
-    if (value) {
-      const index = this.accessOrder.indexOf(key);
-      if (index > -1) {
-        this.accessOrder.splice(index, 1);
-      }
-      this.accessOrder.push(key);
-    }
-    return value;
-  }
-
-  has(key: string): boolean {
-    return this.cache.has(key);
-  }
-
-  delete(key: string): boolean {
-    const index = this.accessOrder.indexOf(key);
-    if (index > -1) {
-      this.accessOrder.splice(index, 1);
-    }
-    return this.cache.delete(key);
-  }
-
-  clear(): void {
-    this.cache.clear();
-    this.accessOrder = [];
-  }
-
-  size(): number {
-    return this.cache.size;
   }
 }
 
@@ -86,10 +33,10 @@ export class TaskOrchestrator {
   private concurrentOps: number = 0;
   private readonly maxCacheSize: number = 1000;
 
-  constructor(sqliteStore: SQLiteStore) {
-    this.sqliteStore = sqliteStore;
-    this.logger = new Logger('TaskOrchestrator');
-    this.taskCache = new LRUCache(this.maxCacheSize);
+  constructor(dependencies: TaskOrchestratorDependencies) {
+    this.sqliteStore = dependencies.sqliteStore;
+    this.logger = dependencies.logger || new Logger('TaskOrchestrator');
+    this.taskCache = new LRUCache<Task>(this.maxCacheSize);
   }
 
   async initialize(): Promise<void> {
@@ -128,31 +75,31 @@ export class TaskOrchestrator {
     }
   }
 
-  private validateTaskStatus(status: Task['status']): void {
-    const validStatuses = ['pending', 'in_progress', 'completed', 'failed', 'cancelled'];
-    if (!validStatuses.includes(status)) {
-      throw new InvalidTaskConfigError(
-        `status must be one of: ${validStatuses.join(', ')}`
-      );
-    }
-  }
+   private validateTaskStatus(status: Task['status']): void {
+     const validStatuses: TaskStatus[] = [TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.COMPLETED, TaskStatus.FAILED];
+     if (!validStatuses.includes(status)) {
+       throw new InvalidTaskConfigError(
+         `status must be one of: ${validStatuses.join(', ')}`
+       );
+     }
+   }
 
   async createTask(config: TaskConfig): Promise<Task> {
     return this.withConcurrencyControl(async () => {
       this.ensureInitialized();
       this.validateTaskConfig(config);
 
-      const task: Task = {
-        id: uuidv4(),
-        agentId: config.agentId,
-        description: config.description,
-        status: 'pending',
-        priority: config.priority || 'medium',
-        createdAt: new Date(),
-        parentTaskId: config.parentTaskId,
-        subtasks: [],
-        metadata: config.metadata
-      };
+       const task: Task = {
+         id: uuidv4(),
+         agentId: config.agentId,
+         description: config.description,
+         status: TaskStatus.PENDING,
+         priority: config.priority || TaskPriority.MEDIUM,
+         createdAt: new Date(),
+         parentTaskId: config.parentTaskId,
+         subtasks: [],
+         metadata: config.metadata
+       };
 
       this.taskCache.set(task.id, task);
       await this.sqliteStore.storeTask(task);
@@ -338,13 +285,13 @@ export class TaskOrchestrator {
     return this.listTasks({ agentId });
   }
 
-  async getPendingTasks(): Promise<Task[]> {
-    return this.listTasks({ status: 'pending' });
-  }
+   async getPendingTasks(): Promise<Task[]> {
+     return this.listTasks({ status: TaskStatus.PENDING });
+   }
 
-  async getInProgressTasks(): Promise<Task[]> {
-    return this.listTasks({ status: 'in_progress' });
-  }
+   async getInProgressTasks(): Promise<Task[]> {
+     return this.listTasks({ status: TaskStatus.IN_PROGRESS });
+   }
 
   /**
    * Get cache statistics for monitoring
